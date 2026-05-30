@@ -3152,17 +3152,36 @@ private:
                                        slot.prompt.tokens.clear();
                                    } else {
                                        // For hybrid models, the recurrent state is content-dependent.
-                                       // If the LCP covers the entire checkpoint (lcp >= n_tokens),
-                                       // the recurrent state is valid for all positions regardless
-                                       // of whether this is same or cross-conversation.
-                                       // If LCP < n_tokens, the recurrent state beyond LCP is from
-                                       // a different conversation and must be discarded.
+                                       // We need to determine how much of the checkpoint's recurrent
+                                       // state is valid based on the LCP (longest common prefix).
+                                       //
+                                       // If LCP covers the entire checkpoint (lcp >= n_tokens),
+                                       // the recurrent state is valid for all positions.
+                                       //
+                                       // If LCP equals the stored prefix limit (4096), the prefix
+                                       // matches completely but we can't verify beyond that. For
+                                       // same-conversation checkpoints (100% overlap), the recurrent
+                                       // state is valid because the conversation only grew by appending.
+                                       // For cross-conversation checkpoints, it's risky.
+                                       //
+                                       // If LCP < stored prefix limit, tokens diverge at position
+                                       // lcp and the recurrent state beyond lcp is invalid.
+                                       const int32_t PREFIX_MAX = KV_SSD_TOKEN_PREFIX_MAX;
                                        if (ssd_lcp >= (int32_t)ssd_n_tokens) {
                                            // LCP covers entire checkpoint - recurrent state is valid
                                            SLT_WRN(slot, "cold-start: checkpoint fully covered by LCP "
                                                    "(lcp=%d >= n_tokens=%lu, overlap=%.1f%%, continuation=%d)\n",
                                                    ssd_lcp, (unsigned long)ssd_n_tokens,
                                                    ssd_overlap * 100.0f, ssd_is_continuation);
+                                       } else if (ssd_lcp >= PREFIX_MAX && ssd_overlap >= 0.99f) {
+                                           // LCP hit storage limit and this is a same-conversation
+                                           // checkpoint (100% overlap). The recurrent state beyond
+                                           // the stored prefix is valid because the conversation
+                                           // only grew by appending tokens.
+                                           SLT_WRN(slot, "cold-start: same-conversation checkpoint with "
+                                                   "full prefix match (lcp=%d >= %d, overlap=%.1f%%, n_tokens=%lu)\n",
+                                                   ssd_lcp, PREFIX_MAX, ssd_overlap * 100.0f,
+                                                   (unsigned long)ssd_n_tokens);
                                        } else {
                                            // LCP doesn't cover entire checkpoint - cap n_past to LCP
                                            int32_t n_past_before = n_past;
