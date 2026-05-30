@@ -409,22 +409,28 @@ bool server_context_page_manager::find_and_load_checkpoint(
     int32_t& out_pos_max,
     uint64_t& out_n_tokens,
     uint64_t conv_hash,
-    int32_t n_past,
-    uint64_t max_n_tokens,
-    int32_t* out_lcp
+   int32_t n_past,
+   uint64_t max_n_tokens,
+   int32_t* out_lcp,
+   float* out_overlap,
+   bool* out_is_continuation
 ) {
     uint64_t effective_conv = conv_hash;
+    bool is_continuation = false;
 
     // Try continuation matching if no cache exists for this conv_hash
     if (effective_conv != 0 && conv_wrappers_.find(effective_conv) == conv_wrappers_.end()) {
+        float overlap = 0.0f;
         uint64_t continuation = kv_ssd_find_continuation(
             ssd_base_path_.c_str(),
             (const uint32_t*)tokens, tokens_size,
-            0.90f, model_compat_hash_);
+            0.90f, model_compat_hash_, &overlap);
         if (continuation != 0) {
             effective_conv = continuation;
+            is_continuation = true;
             LOG_INF("SSD cache: reusing conversation %016lx for cold restart\n",
-                     (unsigned long)continuation);
+                    (unsigned long)continuation);
+            if (out_overlap) *out_overlap = overlap;
         }
     }
 
@@ -442,6 +448,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
     if (ok) {
         cache_hits_++;
         if (out_lcp) *out_lcp = match_lcp;
+        if (out_is_continuation) *out_is_continuation = is_continuation;
     } else {
         cache_misses_++;
     }

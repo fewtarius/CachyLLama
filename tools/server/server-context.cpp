@@ -3097,64 +3097,86 @@ private:
                     }
 
                        // Cold-start: try SSD cache when prompt cache is empty (n_past == 0)
-                       if (n_past == 0 && ssd_page_manager && slot.task) {
-                           int32_t ssd_pos_min = 0, ssd_pos_max = 0;
-                           uint64_t ssd_n_tokens = 0;
-                           int32_t ssd_lcp = 0;
+                      if (n_past == 0 && ssd_page_manager && slot.task) {
+                          int32_t ssd_pos_min = 0, ssd_pos_max = 0;
+                          uint64_t ssd_n_tokens = 0;
+                          int32_t ssd_lcp = 0;
+                          float ssd_overlap = 0.0f;
+                          bool ssd_is_continuation = false;
 
-                            // Compute conversation hash: first 1024 task tokens
-                            // (stable across turns - matches checkpoint storage)
+                           // Compute conversation hash: first 1024 task tokens
+                           // (stable across turns - matches checkpoint storage)
                             const auto& task_tokens = slot.task->tokens.get_tokens();
                             size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
                             uint64_t conv_hash = kv_ssd_hash_tokens(
                                 (const uint32_t*)task_tokens.data(), hash_len);
 
                             if (ssd_page_manager->find_and_load_checkpoint(
-                                    slot.task->tokens.get_tokens().data(),
-                                    slot.task->tokens.get_tokens().size(),
-                                    ssd_turn_counter, ctx_tgt,
-                                    ssd_pos_min, ssd_pos_max, ssd_n_tokens,
-                                    conv_hash, n_past,
-                                    (uint64_t)slot.task->n_tokens(),
-                                    &ssd_lcp)) {
+                                   slot.task->tokens.get_tokens().data(),
+                                   slot.task->tokens.get_tokens().size(),
+                                   ssd_turn_counter, ctx_tgt,
+                                   ssd_pos_min, ssd_pos_max, ssd_n_tokens,
+                                   conv_hash, n_past,
+                                   (uint64_t)slot.task->n_tokens(),
+                                   &ssd_lcp, &ssd_overlap, &ssd_is_continuation)) {
 
-                                // Populate prompt tokens from task so keep_first/pos_next work
-                                slot.prompt.tokens.clear();
+                               // Populate prompt tokens from task so keep_first/pos_next work
+                               slot.prompt.tokens.clear();
                                 slot.prompt.tokens.insert(slot.task->tokens.get_tokens());
 
                                 n_past = std::min((int)slot.prompt.tokens.size(), (int)ssd_n_tokens);
 
                                 // For hybrid models, validate that the LCP covers most of
-                                // the checkpoint. The recurrent state is content-dependent -
-                                // if the LCP is much smaller than the checkpoint's n_tokens,
-                                // the recurrent state beyond the LCP is from a different
-                               // conversation and will produce garbage logits.
-                               if (is_hybrid && ssd_lcp > 0 && ssd_n_tokens > 0) {
-                                   // The token prefix stored with each checkpoint is capped at
-                                   // KV_SSD_TOKEN_PREFIX_MAX (4096). We can only validate the LCP
-                                   // against what was actually stored. For same-conversation
-                                   // checkpoints (found via find_continuation), the recurrent
-                                   // state beyond the prefix is valid because the conversation
-                                   // only grew by appending tokens.
-                                   const uint64_t validated_tokens = std::min(ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
-                                   const float MIN_LCP_RATIO = 0.80f;
-                                   float lcp_ratio = (float)ssd_lcp / (float)validated_tokens;
-                                   if (lcp_ratio < MIN_LCP_RATIO) {
-                                       SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
-                                               "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%)\n",
-                                               ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
-                                               lcp_ratio * 100.0f);
-                                       // Clear the loaded state and reset
-                                       llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
-                                        n_past = 0;
-                                        slot.prompt.tokens.clear();
-                                    } else {
-                                        // LCP covers most of the checkpoint - cap n_past to LCP
-                                        // so only validated recurrent state is used
-                                        n_past = std::min(n_past, ssd_lcp);
-                                        llama_memory_seq_rm_attn_only(llama_get_memory(ctx_tgt), slot.id, n_past, -1);
-                                    }
-                                }
+                               // the checkpoint. The recurrent state is content-dependent -
+                               // if the LCP is much smaller than the checkpoint's n_tokens,
+                               // the recurrent state beyond the LCP is from a different
+                               // conversation and will produce garbage logits. For same-
+                               // conversation checkpoints (overlap >= 99%), the recurrent
+                               // state beyond the LCP is valid because the conversation
+                               // only grew by appending tokens.
+                              if (is_hybrid && ssd_lcp > 0 && ssd_n_tokens > 0) {
+                                  // The token prefix stored with each checkpoint is capped at
+                                  // KV_SSD_TOKEN_PREFIX_MAX (4096). We can only validate the LCP
+                                  // against what was actually stored. For same-conversation
+                                  const uint64_t validated_tokens = std::min(ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
+                                  const float MIN_LCP_RATIO = 0.80f;
+                                  float lcp_ratio = (float)ssd_lcp / (float)validated_tokens;
+                                  if (lcp_ratio < MIN_LCP_RATIO) {
+                                      SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
+                                              "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%)\n",
+                                              ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
+                                              lcp_ratio * 100.0f);
+                                      // Clear the loaded state and reset
+                                      llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                       n_past = 0;
+                                       slot.prompt.tokens.clear();
+                                   } else {
+                                       // For hybrid models, the recurrent state is content-dependent.
+                                       // If the LCP covers the entire checkpoint (lcp >= n_tokens),
+                                       // the recurrent state is valid for all positions regardless
+                                       // of whether this is same or cross-conversation.
+                                       // If LCP < n_tokens, the recurrent state beyond LCP is from
+                                       // a different conversation and must be discarded.
+                                       if (ssd_lcp >= (int32_t)ssd_n_tokens) {
+                                           // LCP covers entire checkpoint - recurrent state is valid
+                                           SLT_WRN(slot, "cold-start: checkpoint fully covered by LCP "
+                                                   "(lcp=%d >= n_tokens=%lu, overlap=%.1f%%, continuation=%d)\n",
+                                                   ssd_lcp, (unsigned long)ssd_n_tokens,
+                                                   ssd_overlap * 100.0f, ssd_is_continuation);
+                                       } else {
+                                           // LCP doesn't cover entire checkpoint - cap n_past to LCP
+                                           int32_t n_past_before = n_past;
+                                           n_past = std::min(n_past, ssd_lcp);
+                                           SLT_WRN(slot, "cold-start: partial LCP coverage "
+                                                   "(lcp=%d < n_tokens=%lu, overlap=%.1f%%, continuation=%d), "
+                                                   "capping n_past from %d to %d\n",
+                                                   ssd_lcp, (unsigned long)ssd_n_tokens,
+                                                   ssd_overlap * 100.0f, ssd_is_continuation,
+                                                   n_past_before, n_past);
+                                       }
+                                       llama_memory_seq_rm_attn_only(llama_get_memory(ctx_tgt), slot.id, n_past, -1);
+                                   }
+                               }
 
                                 if (n_past > 0) {
                                 // Same-conversation checkpoints are always valid (size/staleness

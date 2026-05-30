@@ -127,12 +127,14 @@ public:
         int32_t& out_pos_max,
         uint64_t& out_n_tokens,
         uint64_t conv_hash = 0,
-        int32_t n_past = -1,
-        uint64_t max_n_tokens = UINT64_MAX,
-        int32_t* out_lcp = nullptr
-    );
+       int32_t n_past = -1,
+       uint64_t max_n_tokens = UINT64_MAX,
+       int32_t* out_lcp = nullptr,
+       float* out_overlap = nullptr,
+       bool* out_is_continuation = nullptr
+   );
 
-    // Evict all checkpoints for a specific slot
+   // Evict all checkpoints for a specific slot
     void evict_slot(uint32_t slot_id);
 
     // Get checkpoint data for a specific slot

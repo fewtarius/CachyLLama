@@ -720,12 +720,16 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
             else break;
         }
 
-        if (lcp < (int32_t)cmp_count) continue;
+        // Accept checkpoints with any non-zero LCP. The caller validates
+        // the LCP ratio (e.g. hybrid models require >= 80%). Same-conversation
+        // checkpoints will have lcp == cmp_count (full prefix match).
+        if (lcp == 0) continue;
 
-        // Prefer most recent turn. Within the same turn, prefer more tokens
-        // (larger checkpoint = more cache reuse = less reprocessing).
-        if (ckpt.turn_created > best_turn ||
-            (ckpt.turn_created == best_turn && ckpt.n_tokens > best_n_tokens)) {
+        // Prefer highest LCP first (most cache reuse). Break ties by
+        // most recent turn, then by more tokens within the same turn.
+        if (lcp > best_lcp ||
+            (lcp == best_lcp && ckpt.turn_created > best_turn) ||
+            (lcp == best_lcp && ckpt.turn_created == best_turn && ckpt.n_tokens > best_n_tokens)) {
             best_turn = ckpt.turn_created;
             best_n_tokens = ckpt.n_tokens;
             best_lcp = lcp;
@@ -736,7 +740,7 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
     if (best_id != 0) {
         auto it = cache->index.find(best_id);
         uint64_t ntok = it != cache->index.end() ? (uint64_t)it->second.n_tokens : 0;
-        LOG_INF("SSD cache: within-conv match checkpoint %lu conv=%016lx"
+        LOG_INF("SSD cache: match checkpoint %lu conv=%016lx"
                 " turn=%u n_tokens=%lu lcp=%d\n",
                 (unsigned long)best_id, (unsigned long)cache->conv_hash,
                 best_turn, (unsigned long)ntok, best_lcp);
@@ -878,9 +882,12 @@ uint64_t kv_ssd_find_continuation(
     const char* base_path,
     const uint32_t* tokens, size_t tokens_size,
     float min_overlap,
-    uint64_t compat_hash)
+    uint64_t compat_hash,
+    float* out_overlap)
 {
     if (!base_path || !tokens || tokens_size == 0) return 0;
+
+    if (out_overlap) *out_overlap = 0.0f;
 
     DIR* base_dir = opendir(base_path);
     if (!base_dir) return 0;
@@ -945,7 +952,15 @@ uint64_t kv_ssd_find_continuation(
                 else break;
             }
 
-            float score = (float)matches / (float)cmp_count;
+            // Score: how much of the checkpoint's token range is covered
+            // by the matching prefix. Using n_tokens (not token_count) because
+            // n_tokens is the actual checkpoint size - if the LCP covers most
+            // of n_tokens, the checkpoint's recurrent state is mostly valid.
+            // Cap at 1.0 since LCP can exceed n_tokens when the stored prefix
+            // extends beyond the checkpoint's token range.
+            float score = (rec.n_tokens > 0)
+                ? std::min(1.0f, (float)matches / (float)rec.n_tokens)
+                : 0.0f;
             if (score > best_conv_score) best_conv_score = score;
         }
         closedir(conv_fd);
@@ -960,6 +975,7 @@ uint64_t kv_ssd_find_continuation(
     if (best_conv != 0) {
         LOG_INF("SSD cache: continuation found conv=%016lx overlap=%.1f%%\n",
                 (unsigned long)best_conv, best_score * 100.0f);
+        if (out_overlap) *out_overlap = best_score;
     }
 
     return best_conv;

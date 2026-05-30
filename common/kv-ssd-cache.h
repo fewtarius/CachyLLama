@@ -200,7 +200,8 @@ uint64_t kv_ssd_find_continuation(
     const char* base_path,
     const uint32_t* tokens, size_t tokens_size,
     float min_overlap,
-    uint64_t compat_hash = 0);
+    uint64_t compat_hash = 0,
+    float* out_overlap = nullptr);
 
 // Get maximum turn_id across all conversation directories (for seeding turn counter on restart).
 uint32_t kv_ssd_get_max_turn_id_global(const char* base_path);
