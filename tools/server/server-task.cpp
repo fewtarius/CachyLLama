@@ -1846,3 +1846,22 @@ std::list<server_prompt>::iterator server_prompt_cache::find_eviction_candidate(
 
     return it_worst;
 }
+
+std::string server_task::validate_user_id(std::string user_id) {
+    constexpr size_t MAX_USER_ID_LEN = 512;
+    if (user_id.size() > MAX_USER_ID_LEN) {
+        throw std::invalid_argument(
+            "llama_user_id exceeds maximum length of " + std::to_string(MAX_USER_ID_LEN));
+    }
+    for (char c : user_id) {
+        const bool ok = (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') ||
+                        c == '-' || c == '_';
+        if (!ok) {
+            throw std::invalid_argument(
+                "llama_user_id must match ^[a-zA-Z0-9\\-_]+$ (empty = anonymous)");
+        }
+    }
+    return user_id;
+}

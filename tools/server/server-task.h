@@ -136,6 +136,11 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
+    // explicit, operator-declared user identity. empty = anonymous bucket.
+    // validated against ^[a-zA-Z0-9\-_]+$ and <= 512 chars at request time.
+    // drives SSD cache routing (u/ namespace) and per-user concurrency cap.
+    std::string user_id;
+
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
@@ -209,6 +214,18 @@ struct server_task {
                 return false;
         }
     }
+
+    static task_params params_from_json_cmpl(
+        const llama_vocab * vocab,
+        const common_params & params_base,
+        const int n_ctx_slot,
+        const std::vector<llama_logit_bias> & logit_bias_eog,
+        const json & data);
+
+    // validate a user_id against the allowed character set and length.
+    // returns the input on success, throws std::invalid_argument on failure.
+    // empty string is valid (anonymous bucket).
+    static std::string validate_user_id(std::string user_id);
 
     // utility function
     static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
