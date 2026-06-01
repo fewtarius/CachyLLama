@@ -137,7 +137,11 @@ public:
 
 // Initialize the SSD cache. Creates {path}/{conv_hash}/ directory.
 // Returns nullptr on failure.
-kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t conv_hash);
+// namespace_prefix lets callers segregate cache directories under a subpath.
+// Empty (default) keeps the legacy layout: {path}/{hash_hex}/.
+// Pass "u/" to route to {path}/u/{hash_hex}/, which isolates user_id caches
+// from anonymous conv_hash caches on disk.
+kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t conv_hash, const char* namespace_prefix = "");
 
 // Shutdown: write index and cleanup.
 void kv_ssd_free(kv_ssd_cache* cache);

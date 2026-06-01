@@ -439,7 +439,9 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
 // Public API
 // =============================================================================
 
-kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t conv_hash) {
+kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t conv_hash, const char* namespace_prefix) {
+    namespace_prefix = namespace_prefix ? namespace_prefix : "";
+
     if (!path) return nullptr;
 
     kv_ssd_cache* c = new kv_ssd_cache();
@@ -476,11 +478,18 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
     // Create base directory
     mkdir(path, 0755);
 
-    // Create conversation-specific directory
+    // Create conversation-specific directory. namespace_prefix (e.g. "u/") is
+    // appended to the hash hex so multiple identity schemes can coexist on
+    // disk without colliding.
     char conv_hex[17];
     snprintf(conv_hex, sizeof(conv_hex), "%016lx", (unsigned long)conv_hash);
     c->base_path = std::string(path);
-    c->model_dir = std::string(path) + "/" + conv_hex;
+    c->model_dir = std::string(path) + "/" + namespace_prefix + conv_hex;
+    if (namespace_prefix[0] != '\0') {
+        // Ensure the namespace subdir exists before creating the leaf.
+        std::string ns_dir = std::string(path) + "/" + namespace_prefix;
+        mkdir(ns_dir.c_str(), 0755);
+    }
     mkdir(c->model_dir.c_str(), 0755);
 
     // Load index file for next_id
