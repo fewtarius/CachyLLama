@@ -18,6 +18,17 @@
 
 namespace llama {
 
+// FNV-1a 64-bit hash of a byte string. Mirrors kv_ssd_hash_tokens in shape
+// but operates on raw bytes so it works for any string, not just tokens.
+static uint64_t fnv1a_string(const std::string & s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) {
+        h ^= (uint64_t)c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 server_context_page_manager::server_context_page_manager(
     const char* ssd_path,
     const kv_eviction_config* cfg,
@@ -196,14 +207,18 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     const llama_token* tokens,
     size_t tokens_size,
     uint32_t turn_id,
-    uint64_t conv_hash
+    uint64_t conv_hash,
+    const std::string& user_id
 ) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
     if (!ckpt.data_tgt.data()) return false;
 
-    // Get or create per-conversation cache
-    server_ssd_cache* sc = get_or_create_cache(conv_hash);
+    // Get or create the appropriate cache. user_id routes to a user-scoped
+    // cache in the "u/" namespace; conv_hash routes to the anonymous bucket.
+    server_ssd_cache* sc = user_id.empty()
+        ? get_or_create_cache(conv_hash)
+        : get_or_create_user_cache(user_id);
     if (!sc) return false;
 
     // Evict if needed
@@ -345,8 +360,44 @@ bool server_context_page_manager::find_matching_checkpoint(
     uint64_t& out_n_tokens,
     uint64_t conv_hash,
     int32_t n_past,
-    uint64_t max_n_tokens
+    uint64_t max_n_tokens,
+    const std::string& user_id
 ) {
+    if (!user_id.empty()) {
+        // user-scoped lookups never escape the user's own cache. cross-user
+        // continuation matching is a privacy violation, so we skip it.
+        const uint64_t key = fnv1a_string(user_id);
+        server_ssd_cache* sc = get_or_create_user_cache(user_id);
+        if (!sc) return false;
+
+        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past);
+        if (ckpt_id == 0) { cache_misses_++; return false; }
+
+        for (const auto& [slot_id, cp] : checkpoints_) {
+            if (cp.checkpoint_id == ckpt_id) {
+                out_slot_id = slot_id;
+                out_pos_min = cp.pos_min;
+                out_pos_max = cp.pos_max;
+                out_n_tokens = cp.n_tokens;
+                cache_hits_++;
+                return true;
+            }
+        }
+
+        kv_ssd_cache* raw = user_caches_[key].get();
+        const kv_ssd_checkpoint* meta = kv_ssd_get_meta(raw, ckpt_id);
+        if (meta) {
+            out_slot_id = meta->slot_id;
+            out_pos_min = meta->pos_min;
+            out_pos_max = meta->pos_max;
+            out_n_tokens = meta->n_tokens;
+            cache_hits_++;
+            return true;
+        }
+        cache_misses_++;
+        return false;
+    }
+
     // Try exact conversation match first
     uint64_t effective_conv = conv_hash;
 
@@ -409,12 +460,34 @@ bool server_context_page_manager::find_and_load_checkpoint(
     int32_t& out_pos_max,
     uint64_t& out_n_tokens,
     uint64_t conv_hash,
-   int32_t n_past,
-   uint64_t max_n_tokens,
-   int32_t* out_lcp,
-   float* out_overlap,
-   bool* out_is_continuation
+  int32_t n_past,
+  uint64_t max_n_tokens,
+  int32_t* out_lcp,
+  float* out_overlap,
+   bool* out_is_continuation,
+   const std::string& user_id
 ) {
+    if (!user_id.empty()) {
+        // user-scoped cold-start lookups never escape the user's own cache.
+        // cross-user continuation matching is a privacy violation.
+        server_ssd_cache* sc = get_or_create_user_cache(user_id);
+        if (!sc) return false;
+
+        int32_t match_lcp = 0;
+        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp);
+        if (ckpt_id == 0) { cache_misses_++; return false; }
+
+        bool ok = sc->load(ckpt_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
+        if (ok) {
+            cache_hits_++;
+            if (out_lcp) *out_lcp = match_lcp;
+            if (out_is_continuation) *out_is_continuation = false;
+        } else {
+            cache_misses_++;
+        }
+        return ok;
+    }
+
     uint64_t effective_conv = conv_hash;
     bool is_continuation = false;
 
@@ -504,6 +577,82 @@ void server_context_page_manager::get_stats(
 
 uint32_t server_context_page_manager::get_max_turn_id() const {
     return kv_ssd_get_max_turn_id_global(ssd_base_path_.c_str());
+}
+
+server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const std::string& user_id) {
+    if (user_id.empty()) return nullptr;
+
+    const uint64_t key = fnv1a_string(user_id);
+
+    auto it = user_wrappers_.find(key);
+    if (it != user_wrappers_.end()) {
+        return it->second.get();
+    }
+
+    // Evict oldest user cache if at max. share the max_conversations cap
+    // with the anonymous bucket so the total SSD directory count stays
+    // bounded.
+    if ((int)user_caches_.size() >= max_conversations) {
+        uint64_t oldest = 0;
+        time_t oldest_mtime = 0;
+
+        for (const auto& [uk, cache] : user_caches_) {
+            char hex[17];
+            snprintf(hex, sizeof(hex), "%016lx", (unsigned long)uk);
+            std::string dir = ssd_base_path_ + "/u/" + hex;
+
+            struct stat st;
+            if (stat(dir.c_str(), &st) == 0) {
+                if (oldest == 0 || st.st_mtime < oldest_mtime) {
+                    oldest_mtime = st.st_mtime;
+                    oldest = uk;
+                }
+            }
+        }
+
+        if (oldest != 0) {
+            LOG_WRN("SSD cache: evicting user %016lx (max=%d reached)\n",
+                     (unsigned long)oldest, max_conversations);
+
+            char hex[17];
+            snprintf(hex, sizeof(hex), "%016lx", (unsigned long)oldest);
+            std::string dir = ssd_base_path_ + "/u/" + hex;
+
+            DIR* d = opendir(dir.c_str());
+            if (d) {
+                struct dirent* ent;
+                while ((ent = readdir(d)) != nullptr) {
+                    if (ent->d_name[0] == '.') continue;
+                    std::string file = dir + "/" + ent->d_name;
+                    unlink(file.c_str());
+                }
+                closedir(d);
+            }
+            rmdir(dir.c_str());
+
+            user_wrappers_.erase(oldest);
+            user_caches_.erase(oldest);
+        }
+    }
+
+    auto raw = kv_ssd_init(ssd_base_path_.c_str(), &config_, key, "u/");
+    if (!raw) return nullptr;
+
+    auto cache_ptr = std::unique_ptr<kv_ssd_cache>(raw);
+    auto wrapper = std::make_unique<server_ssd_cache>(raw);
+
+    if (model_compat_hash_ != 0) {
+        wrapper->set_compat_hash(model_compat_hash_);
+    }
+
+    server_ssd_cache* result = wrapper.get();
+    user_caches_[key] = std::move(cache_ptr);
+    user_wrappers_[key] = std::move(wrapper);
+
+    LOG_INF("SSD cache: created new user cache user=%s key=%016lx (total=%zu)\n",
+             user_id.c_str(), (unsigned long)key, user_caches_.size());
+
+    return result;
 }
 
 } // namespace llama

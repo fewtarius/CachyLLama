@@ -2192,7 +2192,8 @@ private:
             }
             ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, cur, prefix_tokens.data(), prefix_tokens.size(),
-                ssd_turn_counter, conv_hash);
+                ssd_turn_counter, conv_hash,
+                slot.task ? slot.task->user_id : std::string());
         }
     }
 
@@ -3013,7 +3014,9 @@ private:
                                                 ssd_turn_counter, ctx_tgt,
                                                 ssd_pos_min, ssd_pos_max, ssd_n_tokens,
                                                 conv_hash, n_past,
-                                                task_n_tokens)) {
+                                                task_n_tokens,
+                                                nullptr, nullptr, nullptr,
+                                                slot.task->user_id)) {
                                             do_reset = false;
                                             ssd_restored = true;
                                         }
@@ -3190,7 +3193,8 @@ private:
                                    ssd_pos_min, ssd_pos_max, ssd_n_tokens,
                                    conv_hash, n_past,
                                    (uint64_t)slot.task->n_tokens(),
-                                   &ssd_lcp, &ssd_overlap, &ssd_is_continuation)) {
+                                   &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
+                                   slot.task->user_id)) {
 
                                // Populate prompt tokens from task so keep_first/pos_next work
                                slot.prompt.tokens.clear();
@@ -3550,7 +3554,8 @@ private:
                                     }
                                     ssd_page_manager->store_checkpoint_with_tokens(
                                         slot.id, ctx_tgt, cur, prefix_tokens.data(),
-                                        prefix_tokens.size(), ssd_turn_counter, conv_hash);
+                                        prefix_tokens.size(), ssd_turn_counter, conv_hash,
+                                        slot.task ? slot.task->user_id : std::string());
                                 }
                             }
                         }

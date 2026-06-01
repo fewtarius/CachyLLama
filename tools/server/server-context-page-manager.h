@@ -71,6 +71,8 @@ public:
         size_t tokens_size,
         uint32_t turn_id,
         uint64_t conv_hash = 0
+        ,
+        const std::string& user_id = std::string()
     );
 
     // Load a checkpoint back to slot memory
@@ -112,7 +114,8 @@ public:
         uint64_t& out_n_tokens,
         uint64_t conv_hash = 0,
         int32_t n_past = -1,
-        uint64_t max_n_tokens = UINT64_MAX
+        uint64_t max_n_tokens = UINT64_MAX,
+        const std::string& user_id = std::string()
     );
 
     // Find matching checkpoint by token prefix and restore to VRAM (cross-session restart)
@@ -131,7 +134,8 @@ public:
        uint64_t max_n_tokens = UINT64_MAX,
        int32_t* out_lcp = nullptr,
        float* out_overlap = nullptr,
-       bool* out_is_continuation = nullptr
+       bool* out_is_continuation = nullptr,
+       const std::string& user_id = std::string()
    );
 
    // Evict all checkpoints for a specific slot
@@ -175,12 +179,24 @@ private:
     // Get or create cache for a conversation hash
     server_ssd_cache* get_or_create_cache(uint64_t conv_hash);
 
+    // Get or create a user-scoped cache. user_id is hashed and the cache
+    // is created under the "u/" namespace, isolated from anonymous
+    // conv_hash caches on disk. Continuation matching across user_id
+    // caches is disabled (privacy).
+    server_ssd_cache* get_or_create_user_cache(const std::string& user_id);
+
     // Per-conversation caches (conv_hash -> cache instance)
     std::string ssd_base_path_;
     kv_ssd_config config_;
     uint64_t model_compat_hash_ = 0;
     std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> conv_caches_;
     std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> conv_wrappers_;
+
+    // User-scoped caches. Parallel to conv_caches_ but isolated on disk
+    // under the "u/" namespace. Keyed by fnv1a(user_id) so the on-disk
+    // layout is the same hash format as anonymous caches.
+    std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> user_caches_;
+    std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> user_wrappers_;
 };
 
 } // namespace llama
