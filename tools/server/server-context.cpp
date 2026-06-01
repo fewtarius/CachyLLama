@@ -24,6 +24,7 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <unordered_map>
 #include <filesystem>
 #include <utility>
 
@@ -79,6 +80,11 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+
+    // user identity assigned when the slot is claimed. empty = anonymous.
+    // drives the per-user concurrency counter (incremented on claim,
+    // decremented on release). see server_context::user_counts_.
+    std::string user_id;
 
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
@@ -723,6 +729,11 @@ private:
     llama_token* slot_similarity_cache = nullptr;
     size_t slot_similarity_cache_size = 0;
 
+    // Per-user in-flight slot count. empty user_id buckets as "_anonymous".
+    // Accessed only under the queue's mutex_tasks (held by the slot allocation
+    // path), so no separate lock is needed.
+    std::unordered_map<std::string, int> user_counts_;
+
     void destroy() {
         spec.reset();
         ctx_dft.reset();
@@ -1144,6 +1155,25 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // decrement per-user counter. empty user_id buckets as
+                // "_anonymous" so opt-out callers are still subject to the
+                // cap. clear slot.user_id so a future LCP match can claim
+                // the slot for a different identity.
+                const auto & uid = slots[id_slot].user_id;
+                if (!uid.empty()) {
+                    auto it = user_counts_.find(uid);
+                    if (it != user_counts_.end() && --(it->second) <= 0) {
+                        user_counts_.erase(it);
+                    }
+                } else {
+                    auto it = user_counts_.find("_anonymous");
+                    if (it != user_counts_.end() && --(it->second) <= 0) {
+                        user_counts_.erase(it);
+                    }
+                }
+                slots[id_slot].user_id.clear();
+
                 // notify SSD page manager of turn completion (used for turn-based eviction)
                 if (ssd_page_manager) {
                     ssd_page_manager->on_turn_complete(++ssd_turn_counter);
@@ -1330,6 +1360,21 @@ private:
     }
 
     server_slot * get_available_slot(const server_task & task) {
+        // per-user concurrency cap. bucket name is the user_id, with empty
+        // user_id bucketing under "_anonymous" so opt-out callers are still
+        // subject to the cap (fairness).
+        const std::string user_bucket = task.user_id.empty() ? std::string("_anonymous") : task.user_id;
+        if (params_base.max_concurrent_per_user > 0) {
+            auto it = user_counts_.find(user_bucket);
+            const int cur = (it == user_counts_.end()) ? 0 : it->second;
+            if (cur >= params_base.max_concurrent_per_user) {
+                SRV_INF("per-user concurrency cap reached for user_id=%s (cap=%d, in_flight=%d)\n",
+                        task.user_id.empty() ? "<anonymous>" : task.user_id.c_str(),
+                        params_base.max_concurrent_per_user, cur);
+                return nullptr;
+            }
+        }
+
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1353,6 +1398,13 @@ private:
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+
+                // skip slots owned by a different active user. an empty
+                // slot.user_id means the slot is unowned and may be claimed
+                // by any user.
+                if (!slot.user_id.empty() && slot.user_id != task.user_id) {
+                    continue;
+                }
 
                 // select the current slot if the criteria match
                 if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
@@ -1385,6 +1437,16 @@ private:
                     continue;
                 }
 
+                // prefer slots that already belong to the same user_id
+                // (cache locality - the slot may already hold a warm prompt).
+                // an empty slot.user_id means the slot is unowned (cleared
+                // on release) and may be claimed by any user. a non-empty
+                // user_id that differs from the task's is an active owner
+                // and must not be displaced.
+                if (!slot.user_id.empty() && slot.user_id != task.user_id) {
+                    continue;
+                }
+
                 // select the current slot if the criteria match
                 if (!ret || slot.t_last_used <= t_last) {
                     t_last = slot.t_last_used;
@@ -1396,6 +1458,16 @@ private:
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
 
                 update_cache = true;
+            }
+        }
+
+        if (ret) {
+            // record user_id on the slot and bump the per-user counter.
+            // get_available_slot is called under the queue's mutex_tasks
+            // (queue_tasks::update() holds it), so the map is safe to mutate.
+            if (ret->user_id != task.user_id) {
+                ret->user_id = task.user_id;
+                user_counts_[user_bucket]++;
             }
         }
 
