@@ -4208,6 +4208,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
 
+            // explicit user identity. set by server-chat.cpp from
+            // metadata.user_id (Anthropic) or llama_user_id (OpenAI).
+            // empty = anonymous bucket. validate_user_id throws on
+            // malformed input, which the caller converts to HTTP 400.
+            task.user_id = server_task::validate_user_id(
+                json_value(data, "llama_user_id", std::string()));
+
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
