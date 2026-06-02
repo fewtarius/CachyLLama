@@ -3072,7 +3072,7 @@ private:
                                                 pos_next = n_past;
                                             } else {
                                                 pos_next = std::min(pos_next, std::max(ssd_pos_min + 1, ssd_pos_max));
-                                                n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), ssd_n_tokens);
+                                                n_past = (int)std::min<int64_t>((int64_t)slot.prompt.tokens.size_up_to_pos(pos_next), (int64_t)ssd_n_tokens);
                                             }
 
                                             // Safety: if restored n_past covers the entire new task,
