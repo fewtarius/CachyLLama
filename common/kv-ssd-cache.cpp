@@ -19,6 +19,12 @@
 
 #ifdef __linux__
 #include <sys/sysinfo.h>
+#include <fcntl.h>  // posix_fadvise
+#endif
+
+// macOS has posix_fadvise via fcntl.h but defines it differently
+#ifdef __APPLE__
+#include <fcntl.h>
 #endif
 
 // Magic numbers
@@ -110,6 +116,44 @@ static std::string ckpt_path(const kv_ssd_cache* c, uint64_t id) {
 // Get index file path: {model_dir}/index.bin
 static std::string index_path(const kv_ssd_cache* c) {
     return c->model_dir + "/index.bin";
+}
+
+// Hint to the kernel that a checkpoint file will be needed soon.
+// On Linux, uses posix_fadvise(POSIX_FADV_WILLNEED) to trigger
+// async page cache prefetch. On other platforms, uses readahead().
+// This overlaps SSD I/O with CPU work (token matching, etc.).
+// Thread-safe: takes the cache mutex only for the index lookup.
+static void ckpt_readahead(kv_ssd_cache* c, uint64_t id) {
+    std::string path;
+    off_t total_size = 0;
+    bool need_prefetch = false;
+
+    {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        auto it = c->index.find(id);
+        if (it == c->index.end()) return;
+
+        // Already in RAM - no need to prefetch
+        if (it->second.tier == KV_TIER_HOT || it->second.tier == KV_TIER_WARM) return;
+
+        path = ckpt_path(c, id);
+        total_size = (off_t)(sizeof(kv_ssd_record) + (size_t)it->second.data_size);
+        need_prefetch = true;
+    }
+    // Mutex released - path and total_size are local copies
+
+    if (!need_prefetch) return;
+
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return;
+
+#ifdef __linux__
+    posix_fadvise(fd, 0, total_size, POSIX_FADV_WILLNEED);
+#elif defined(__APPLE__)
+    readahead(fd, 0, total_size);
+#endif
+
+    close(fd);
 }
 
 // =============================================================================
@@ -397,6 +441,22 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
 
     // Cold - read from SSD file
     std::string filepath = ckpt_path(c, id);
+
+    // Hint kernel to prefetch the file before we read it.
+    // This is a no-op if kv_ssd_prefetch was already called for this checkpoint.
+    // Note: ckpt_readahead takes the mutex, but we already hold it here.
+    // Instead, we do the fadvise inline since we're already locked.
+#ifdef __linux__
+    {
+        int ra_fd = open(filepath.c_str(), O_RDONLY);
+        if (ra_fd >= 0) {
+            size_t total = sizeof(kv_ssd_record) + (size_t)ckpt.data_size;
+            posix_fadvise(ra_fd, 0, (off_t)total, POSIX_FADV_WILLNEED);
+            close(ra_fd);
+        }
+    }
+#endif
+
     int fd = open(filepath.c_str(), O_RDONLY);
     if (fd < 0) {
         LOG_WRN("SSD cache: checkpoint file %s not found\n", filepath.c_str());
@@ -1046,4 +1106,20 @@ uint32_t kv_ssd_get_max_turn_id_global(const char* base_path) {
     closedir(base_dir);
 
     return max_turn;
+}
+
+void kv_ssd_prefetch(kv_ssd_cache* cache, uint64_t checkpoint_id) {
+    if (!cache || !cache->initialized || checkpoint_id == 0) return;
+    ckpt_readahead(cache, checkpoint_id);
+}
+
+void kv_ssd_prefetch_slot(kv_ssd_cache* cache, uint32_t slot_id) {
+    if (!cache || !cache->initialized) return;
+
+    // Prefetch all cold checkpoints for this slot
+    for (const auto& [id, ckpt] : cache->index) {
+        if (ckpt.slot_id == slot_id && ckpt.tier == KV_TIER_COLD) {
+            ckpt_readahead(cache, id);
+        }
+    }
 }

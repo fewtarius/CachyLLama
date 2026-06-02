@@ -210,4 +210,14 @@ uint64_t kv_ssd_find_continuation(
 // Get maximum turn_id across all conversation directories (for seeding turn counter on restart).
 uint32_t kv_ssd_get_max_turn_id_global(const char* base_path);
 
+// Hint that a checkpoint will be needed soon.
+// Triggers kernel page cache prefetch (posix_fadvise WILLNEED on Linux,
+// readahead on macOS) to overlap SSD I/O with CPU work.
+// Safe to call from any thread. No-op if checkpoint is already in RAM.
+void kv_ssd_prefetch(kv_ssd_cache* cache, uint64_t checkpoint_id);
+
+// Prefetch all cold checkpoints for a given slot.
+// Useful for pre-warming the page cache before a slot is processed.
+void kv_ssd_prefetch_slot(kv_ssd_cache* cache, uint32_t slot_id);
+
 #endif // KV_SSD_CACHE_H

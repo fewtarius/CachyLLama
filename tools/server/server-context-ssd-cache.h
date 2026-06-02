@@ -54,6 +54,17 @@ public:
     // Find best checkpoint for a slot.
     uint64_t find_by_slot(uint32_t slot_id, uint64_t min_tokens, uint32_t current_turn);
 
+    // Hint that a checkpoint will be needed soon.
+    // Triggers kernel page cache prefetch to overlap SSD I/O with CPU work.
+    void prefetch(uint64_t checkpoint_id) {
+        kv_ssd_prefetch(cache_, checkpoint_id);
+    }
+
+    // Prefetch all cold checkpoints for a slot.
+    void prefetch_slot(uint32_t slot_id) {
+        kv_ssd_prefetch_slot(cache_, slot_id);
+    }
+
     // Notify turn completion (triggers tier demotion).
     void on_turn_complete(uint32_t turn_id);
 

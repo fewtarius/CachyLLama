@@ -327,14 +327,14 @@ void server_context_page_manager::prefetch_for_slot(uint32_t slot_id, uint32_t /
     auto it = checkpoints_.find(slot_id);
     if (it == checkpoints_.end()) return;
 
-    // Find and load from whichever cache has this checkpoint
+    // Prefetch all cold checkpoints for this slot across all conversation caches.
+    // This triggers kernel page cache readahead so the SSD I/O overlaps with
+    // subsequent CPU work (token matching, state restoration, etc.).
     for (auto& [conv, cache] : conv_caches_) {
-        const kv_ssd_checkpoint* meta = kv_ssd_get_meta(cache.get(), it->second.checkpoint_id);
-        if (meta && meta->tier == KV_TIER_COLD) {
-            std::vector<uint8_t> dummy;
-            kv_ssd_load(cache.get(), it->second.checkpoint_id, dummy);
-            return;
-        }
+        kv_ssd_prefetch_slot(cache.get(), slot_id);
+    }
+    for (auto& [key, cache] : user_caches_) {
+        kv_ssd_prefetch_slot(cache.get(), slot_id);
     }
 }
 
@@ -477,6 +477,9 @@ bool server_context_page_manager::find_and_load_checkpoint(
         uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp);
         if (ckpt_id == 0) { cache_misses_++; return false; }
 
+        // Prefetch the checkpoint file from SSD while we prepare to load it.
+        sc->prefetch(ckpt_id);
+
         bool ok = sc->load(ckpt_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
         if (ok) {
             cache_hits_++;
@@ -516,6 +519,11 @@ bool server_context_page_manager::find_and_load_checkpoint(
         cache_misses_++;
         return false;
     }
+
+    // Prefetch the checkpoint file from SSD while we prepare to load it.
+    // This triggers kernel page cache readahead so the SSD I/O overlaps
+    // with the state restoration setup in load().
+    sc->prefetch(ckpt_id);
 
     bool ok = sc->load(ckpt_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
     if (ok) {
