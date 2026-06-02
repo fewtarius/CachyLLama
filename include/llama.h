@@ -1575,6 +1575,12 @@ extern "C" {
     // Check if expert tracking is enabled
     LLAMA_API bool llama_expert_tracking_enabled(const struct llama_context * ctx);
 
+    // Get the number of experts per layer (0 if not an MoE model)
+    LLAMA_API int32_t llama_model_n_expert(const struct llama_model * model);
+
+    // Get the number of experts used per token (0 if not an MoE model)
+    LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
+
     // Get expert activation statistics for a specific layer.
     // Returns 0 on success, -1 if tracking is disabled or layer is out of range.
     // The caller must NOT free activation_count - it points into internal state.

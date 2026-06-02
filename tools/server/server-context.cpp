@@ -639,6 +639,7 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
+    llama_context * ctx_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -685,8 +686,6 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
-
-    llama_context * ctx_tgt = nullptr;
 
     llama_batch batch {};
 
@@ -5230,6 +5229,99 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_expert_stats = [this](const server_http_req & /* req */) {
+        auto res = create_response();
+
+        // Check if the model has MoE experts
+        const int32_t n_expert = llama_model_n_expert(ctx_server.model_tgt);
+        const int32_t n_expert_used = llama_model_n_expert_used(ctx_server.model_tgt);
+        const int32_t n_layer = llama_model_n_layer(ctx_server.model_tgt);
+
+        if (n_expert <= 0) {
+            res->ok(json {
+                {"n_expert", 0},
+                {"n_expert_used", 0},
+                {"n_layer", n_layer},
+                {"tracking_enabled", false},
+                {"layers", json::array()},
+            });
+            return res;
+        }
+
+        // Get the context
+        llama_context * ctx = ctx_server.ctx_tgt;
+
+        json layers = json::array();
+        for (int32_t il = 0; il < n_layer; il++) {
+            struct llama_expert_stats stats;
+            int32_t rc = llama_expert_stats_get(ctx, il, &stats);
+
+            json layer_data;
+            layer_data["layer"] = il;
+
+            if (rc != 0 || !llama_expert_tracking_enabled(ctx)) {
+                layer_data["tracking_enabled"] = false;
+                layer_data["total_tokens"] = (uint64_t)0;
+                layer_data["activations"] = json::array();
+            } else {
+                layer_data["tracking_enabled"] = true;
+                layer_data["total_tokens"] = (uint64_t)stats.total_tokens;
+
+                json activations = json::array();
+                for (int32_t e = 0; e < stats.n_expert; e++) {
+                    json expert_data;
+                    expert_data["expert"] = e;
+                    expert_data["count"] = (uint64_t)stats.activation_count[e];
+                    if (stats.total_tokens > 0) {
+                        expert_data["frequency"] = (double)stats.activation_count[e] / (double)((uint64_t)stats.total_tokens * (uint64_t)stats.n_expert_used);
+                    } else {
+                        expert_data["frequency"] = 0.0;
+                    }
+                    activations.push_back(expert_data);
+                }
+                layer_data["activations"] = activations;
+            }
+
+            layers.push_back(layer_data);
+        }
+
+        res->ok(json {
+            {"n_expert", n_expert},
+            {"n_expert_used", n_expert_used},
+            {"n_layer", n_layer},
+            {"tracking_enabled", llama_expert_tracking_enabled(ctx)},
+            {"layers", layers},
+        });
+        return res;
+    };
+
+    this->post_expert_tracking = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        try {
+            const json body = json::parse(req.body);
+            bool enable = body.value("enabled", true);
+            bool reset = body.value("reset", false);
+
+            llama_context * ctx = ctx_server.ctx_tgt;
+
+            if (reset) {
+                llama_expert_stats_reset(ctx);
+            }
+
+            llama_expert_tracking_enable(ctx, enable);
+
+            res->ok(json {
+                {"enabled", llama_expert_tracking_enabled(ctx)},
+                {"reset", reset},
+            });
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("Invalid request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+
         return res;
     };
 }
