@@ -15552,7 +15552,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    // APU/iGPU workaround: large compute batches can exceed the kernel's 2s
+    // amdgpu.lockup_timeout and fragment the SA suballocator, surfacing as
+    // "radv/amdgpu: Not enough memory for command submission" followed by
+    // vk::Queue::submit: ErrorDeviceLost. UMA devices (RDNA3 Phoenix, etc.)
+    // default to 8 nodes per submit so each batch finishes well under 2s.
+    // Override with GGML_VK_NODES_PER_SUBMIT=N (>=1) if you need a specific
+    // value; the override is also honored on discrete GPUs.
+    int nodes_per_submit;
+    {
+        static int env_override = -2;  // -2 = unparsed, -1 = unset, >=1 = explicit value
+        if (env_override == -2) {
+            const char * env = getenv("GGML_VK_NODES_PER_SUBMIT");
+            int v = env ? std::atoi(env) : -1;
+            env_override = v > 0 ? v : -1;
+        }
+        if (env_override > 0) {
+            nodes_per_submit = env_override;
+        } else if (ctx->device->uma) {
+            nodes_per_submit = 8;
+        } else {
+            nodes_per_submit = 100;
+        }
+    }
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
