@@ -5889,10 +5889,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
 
         // Submit at least every 100 nodes, in case there are workloads without as much matmul.
-        device->max_nodes_per_submit = 100;
+        // APU/iGPU workaround: large compute batches can exceed the kernel's 2s
+        // amdgpu.lockup_timeout and fragment the SA suballocator, surfacing as
+        // "radv/amdgpu: Not enough memory for command submission" followed by
+        // vk::Queue::submit: ErrorDeviceLost. UMA devices (RDNA3 Phoenix, etc.)
+        // default to 8 nodes per submit so each batch finishes well under 2s.
+        device->max_nodes_per_submit = device->uma ? 8 : 100;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
-        if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
-            uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
+        const char* GGML_VK_NODES_PER_SUBMIT    = getenv("GGML_VK_NODES_PER_SUBMIT");
+        const char * env_val = GGML_VK_NODES_PER_SUBMIT ? GGML_VK_NODES_PER_SUBMIT : GGML_VK_MAX_NODES_PER_SUBMIT;
+        if (env_val != nullptr) {
+            uint32_t max_nodes_per_submit = std::stoul(env_val);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
         }
 
