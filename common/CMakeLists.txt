@@ -94,6 +94,8 @@ add_library(${TARGET}
     ngram-mod.h
     kv-ssd-cache.cpp
     kv-ssd-cache.h
+    kv-ssd-system-cache.cpp
+    kv-ssd-system-cache.h
     peg-parser.cpp
     peg-parser.h
     preset.cpp
