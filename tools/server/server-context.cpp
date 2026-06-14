@@ -2402,6 +2402,10 @@ private:
 
         // Restore the state from disk. The state file covers [0..n_sys)
         // (we saved it that way in extract_and_store_system_prompt).
+        // (Actually, the file may cover [0..batch_end) where batch_end >=
+        // boundary - we save the full state at extraction time. But the
+        // state is stored per-position, so cell[boundary-1] is the correct
+        // recurrent state at position boundary regardless.)
         if (!llama_state_seq_set_data_ext(ctx_tgt,
                 state_data.data(), state_data.size(),
                 slot.id, LLAMA_STATE_SEQ_FLAGS_NONE)) {
@@ -2456,29 +2460,18 @@ private:
             return;
         }
 
-        // For non-hybrid models we can extract at any time. The state for
-        // [0..n_sys) is identical regardless of what comes after. We just
-        // need to save the state and trim to n_sys.
-        //
-        // For hybrid models, the recurrent state at position N depends on
-        // all previous tokens. The state file would cover [0..batch_end),
-        // so we need to load it, trim to [0..n_sys), and re-save. This is
-        // destructive for the slot (we'd need to re-process [n_sys..batch_end)
-        // afterwards), so we skip extraction for hybrid models to keep the
-        // hot path simple. The system prompt can still be extracted on a
-        // future request once the user content is small enough.
-        if (is_hybrid) {
-            // For hybrid, only extract if we're at the exact boundary.
-            // (Otherwise the recurrent state extends past n_sys.)
-            if (batch_end != boundary) return;
-        }
+        // The system prompt cache works for both non-hybrid and hybrid
+        // models. The state is stored per-position (cells[k] = state after
+        // processing tokens 0..k-1), so we can save the full state at
+        // batch_end and on restore set n_past to boundary. The inference
+        // then uses cell[boundary-1] for the recurrent state, which is
+        // exactly what we need regardless of how many tokens were
+        // processed after the system prompt.
 
-        // Save state, then trim to n_sys, then re-save the trimmed state.
-        // This is the simplest correct approach for both architectures:
-        //   - non-hybrid: KV is positional, trimming just removes entries
-        //   - hybrid:    recurrent cells are also positional in our storage
-        //                (cells[k] = state after tokens 0..k-1), trimming
-        //                discards positions past n_sys
+        // Save the full slot state (covers [0..batch_end)). On restore we
+        // set n_past to boundary, so only cells for positions [0..boundary)
+        // are used - the rest are ignored. This works for both architectures
+        // because both KV cache and recurrent state are stored per-position.
         std::vector<uint8_t> state_data;
         {
             const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id,
@@ -2496,8 +2489,9 @@ private:
         // full state (which may include user tokens) is safe because:
         //   - For non-hybrid: the KV is positional, only [0..n_sys) is
         //     reused; the rest will be discarded via seq_rm after restore.
-        //   - For hybrid:    we only get here when batch_end == n_sys, so
-        //     the state covers exactly [0..n_sys).
+        //   - For hybrid:    cell[boundary-1] in the saved file is the
+        //                    recurrent state at position boundary, which
+        //                    is what we want regardless of batch_end.
         if (!sys_cache->store(sys_tokens.data(), (uint32_t) sys_tokens.size(),
                               state_data.data(), state_data.size())) {
             SRV_WRN("%s", "system prompt cache: store failed\n");
