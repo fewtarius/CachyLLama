@@ -149,6 +149,10 @@ flake.lock
 # emscripten
 a.out.*
 
+# CLIO (managed automatically)
+.clio/*
+!.clio/instructions.md
+
 # AGENTS
 
 AGENTS.local.md

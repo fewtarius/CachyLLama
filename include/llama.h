@@ -629,7 +629,11 @@ extern "C" {
     // Returns true if the model is recurrent (like Mamba, RWKV, etc.)
     LLAMA_API bool llama_model_is_recurrent(const struct llama_model * model);
 
-    // Returns true if the model is hybrid (like Jamba, Granite, etc.)
+
+    // Returns true if the model uses multi-head latent attention (MLA) with compressed KV cache
+    LLAMA_API bool llama_model_is_mla(const struct llama_model * model);
+
+   // Returns true if the model is hybrid (like Jamba, Granite, etc.)
     LLAMA_API bool llama_model_is_hybrid(const struct llama_model * model);
 
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
@@ -716,6 +720,16 @@ extern "C" {
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
     LLAMA_API bool llama_memory_seq_rm(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Remove attention-only tokens from the specified sequence [p0, p1)
+    // For hybrid models, this clears KV cache entries without affecting recurrent state.
+    // For non-hybrid models, this is equivalent to llama_memory_seq_rm.
+    // Returns true if successful, false if the operation is not supported.
+    LLAMA_API bool llama_memory_seq_rm_attn_only(
             llama_memory_t mem,
               llama_seq_id seq_id,
                  llama_pos p0,

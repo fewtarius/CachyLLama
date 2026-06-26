@@ -1462,6 +1462,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"-cpent", "--checkpoint-every-n-tokens"}, "N",
+        string_format("create a checkpoint every n tokens during prefill (processing), -1 to disable (default: %d)", params.checkpoint_every_nt),
+        [](common_params & params, int value) {
+            params.checkpoint_every_nt = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_EVERY_N_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
@@ -1469,6 +1476,65 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-ssd", "--cache-ssd"}, "PATH",
+        "enable SSD-backed KV cache with path to storage directory",
+        [](common_params & params, const std::string & value) {
+            params.cache_ssd_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-cp", "--cache-ssd-checkpoints"}, "N",
+        string_format("max number of SSD-backed checkpoints per slot (default: %d)", params.cache_ssd_max_checkpoints),
+        [](common_params & params, int value) {
+            params.cache_ssd_max_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-hot", "--cache-ssd-hot-window"}, "N",
+        string_format("always-keep window size in tokens for SSD cache (default: %zu)", params.cache_ssd_hot_window_tokens),
+        [](common_params & params, int value) {
+            params.cache_ssd_hot_window_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_HOT_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-warm", "--cache-ssd-warm-window"}, "N",
+        string_format("keep-in-RAM window size in tokens for SSD cache (default: %zu)", params.cache_ssd_warm_window_tokens),
+        [](common_params & params, int value) {
+            params.cache_ssd_warm_window_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_WARM_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-mc", "--cache-ssd-max-cold"}, "N",
+        string_format("max cold tier checkpoints before oldest-first eviction (default: %d, 0=unlimited)", params.cache_ssd_max_cold),
+        [](common_params & params, int value) {
+            params.cache_ssd_max_cold = value;
+        }
+   ).set_env("LLAMA_ARG_CACHE_SSD_MAX_COLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-max-conversations"}, "N",
+        string_format("max conversation directories (default: %d, 0=unlimited)", params.cache_ssd_max_conversations),
+        [](common_params & params, int value) {
+            params.cache_ssd_max_conversations = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_MAX_CONVERSATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-max"}, "N",
+        string_format("max system prompt cache entries (default: %d, 0=disabled)", params.prompt_cache_max),
+        [](common_params & params, int value) {
+            params.prompt_cache_max = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+   add_opt(common_arg(
+        {"-ssd-ps", "--cache-ssd-page-size"}, "N",
+        string_format("tokens per page for SSD cache: 512, 1024, 2048 (default: %zu)", params.cache_ssd_page_size_tokens),
+        [](common_params & params, int value) {
+            if (value != 512 && value != 1024 && value != 2048) {
+                throw std::invalid_argument("invalid page size, must be 512, 1024, or 2048");
+            }
+            params.cache_ssd_page_size_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_PAGE_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

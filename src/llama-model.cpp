@@ -2637,6 +2637,11 @@ bool llama_model_is_recurrent(const llama_model * model) {
     return llm_arch_is_recurrent(model->arch);
 }
 
+
+bool llama_model_is_mla(const llama_model * model) {
+    return model->hparams.is_mla();
+}
+
 bool llama_model_is_hybrid(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch);
 }

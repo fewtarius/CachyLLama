@@ -596,6 +596,9 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // timestamp of last access (used for smarter cache eviction)
+    int64_t t_last_used = 0;
+
     size_t size() const {
         size_t res = 0;
 
@@ -643,7 +646,21 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
-    void update();
+    // update cache, evicting entries that exceed memory limits
+    // tokens_ref: the incoming task tokens, used to compute overlap for smarter eviction
+    void update(const server_tokens * tokens_ref = nullptr);
+
+    // Force eviction of the least valuable checkpoint to free up KV cache space.
+    // tokens_ref: if provided, overlap with this is used to avoid evicting useful entries
+    // Returns true if an entry was evicted, false if cache is empty.
+    bool evict(const server_tokens * tokens_ref = nullptr);
+
+private:
+    // Find the least valuable cache entry to evict.
+    // Scores entries by: recency (older = more evictable), size (larger = more evictable),
+    // and overlap with tokens_ref (less overlap = more evictable).
+    // Returns iterator to the worst entry.
+    std::list<server_prompt>::iterator find_eviction_candidate(const server_tokens * tokens_ref = nullptr);
 };
 
 // used exclusively by router mode
