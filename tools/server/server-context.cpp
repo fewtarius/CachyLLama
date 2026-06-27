@@ -3306,7 +3306,7 @@ private:
                                         task_tokens.data(), task_tokens.size(),
                                         ssd_turn_counter, ctx_tgt,
                                         ssd_pos_min, ssd_pos_max, ssd_n_tokens,
-                                        slot.conv_hash, 0, UINT64_MAX, &ssd_lcp)) {
+                                        slot.conv_hash, 0, (uint64_t)task_tokens.size(), &ssd_lcp)) {
                                     // Push checkpoint's full token count.
                                     // ssd_lcp from find_match is capped at
                                     // KV_SSD_TOKEN_PREFIX_MAX (4096), but
