@@ -3593,6 +3593,11 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+
+                                        // after restoring a checkpoint, the recurrent state positions
+                                        // may not align with token indices on hybrid models (MoE/SSM).
+                                        // use seq_rm_attn_only instead of full seq_rm to avoid crash
+                                        slot.ssd_cold_start_used = true;
                                     }
 
                                     if (do_reset) {
@@ -3654,9 +3659,10 @@ private:
                     slot.print_timings_pp();
 
                     // truncate any tokens that are beyond n_past for this slot.
-                    // skip when SSD cache restored the model state — the model
-                    // positions after SSD restore may not match token indices,
-                    // and the restore already loaded the correct state.
+                    // skip when a checkpoint restored state (SSD cache or in-memory) —
+                    // the model positions after checkpoint restore may not match token
+                    // indices on hybrid models (MoE/SSM), and the restore already loaded
+                    // the correct recurrent state. full seq_rm would crash.
                     if (!slot.ssd_cold_start_used) {
                         const llama_pos p0 = slot.prompt.tokens.pos_next();
 
