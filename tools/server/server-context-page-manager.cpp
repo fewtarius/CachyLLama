@@ -197,12 +197,13 @@ bool server_context_page_manager::store_checkpoint(
     const common_prompt_checkpoint& ckpt,
     uint32_t turn_id
 ) {
-    return store_checkpoint_with_tokens(slot_id, ctx, ckpt, nullptr, 0, turn_id);
+    return store_checkpoint_with_tokens(slot_id, ctx, nullptr, ckpt, nullptr, 0, turn_id);
 }
 
 bool server_context_page_manager::store_checkpoint_with_tokens(
     uint32_t slot_id,
     struct llama_context* ctx,
+    struct llama_context* ctx_dft,
     const common_prompt_checkpoint& ckpt,
     const llama_token* tokens,
     size_t tokens_size,
@@ -228,7 +229,7 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
         if (it != checkpoints_.end()) evict_slot_internal(it->first);
     }
 
-    uint64_t ckpt_id = sc->store(slot_id, ctx, ckpt, tokens, tokens_size, turn_id);
+    uint64_t ckpt_id = sc->store(slot_id, ctx, ctx_dft, ckpt, tokens, tokens_size, turn_id);
     if (ckpt_id == 0) return false;
 
     stored_checkpoint sc2;
@@ -253,9 +254,11 @@ bool server_context_page_manager::load_checkpoint(
     uint32_t slot_id,
     uint32_t /* turn_id */,
     struct llama_context* ctx,
+    struct llama_context* ctx_dft,
     int32_t& out_pos_min,
     int32_t& out_pos_max,
-    uint64_t& out_n_tokens
+    uint64_t& out_n_tokens,
+    std::vector<uint8_t>* out_spec_data
 ) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
@@ -277,7 +280,7 @@ bool server_context_page_manager::load_checkpoint(
     if (!sc) return false;
 
     // Load from SSD cache, which will promote to hot tier
-    bool ok = sc->load(it->second.checkpoint_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
+    bool ok = sc->load(it->second.checkpoint_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
 
     if (ok) {
         it->second.last_access = get_timestamp_ms();
@@ -293,9 +296,11 @@ bool server_context_page_manager::load_checkpoint(
 bool server_context_page_manager::load_checkpoint_by_id(
     uint64_t checkpoint_id,
     struct llama_context* ctx,
+    struct llama_context* ctx_dft,
     int32_t& out_pos_min,
     int32_t& out_pos_max,
-    uint64_t& out_n_tokens
+    uint64_t& out_n_tokens,
+    std::vector<uint8_t>* out_spec_data
 ) {
     if (checkpoint_id == 0) return false;
 
@@ -311,7 +316,7 @@ bool server_context_page_manager::load_checkpoint_by_id(
     }
     if (!sc) return false;
 
-    bool ok = sc->load(checkpoint_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
+    bool ok = sc->load(checkpoint_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
 
     if (ok) {
         cache_hits_++;
@@ -456,16 +461,18 @@ bool server_context_page_manager::find_and_load_checkpoint(
     size_t tokens_size,
     uint32_t current_turn,
     struct llama_context* ctx,
+    struct llama_context* ctx_dft,
     int32_t& out_pos_min,
     int32_t& out_pos_max,
     uint64_t& out_n_tokens,
+    std::vector<uint8_t>* out_spec_data,
     uint64_t conv_hash,
-  int32_t n_past,
-  uint64_t max_n_tokens,
-  int32_t* out_lcp,
-  float* out_overlap,
-   bool* out_is_continuation,
-   const std::string& user_id
+    int32_t n_past,
+    uint64_t max_n_tokens,
+    int32_t* out_lcp,
+    float* out_overlap,
+    bool* out_is_continuation,
+    const std::string& user_id
 ) {
     if (!user_id.empty()) {
         // user-scoped cold-start lookups never escape the user's own cache.
@@ -480,7 +487,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
         // Prefetch the checkpoint file from SSD while we prepare to load it.
         sc->prefetch(ckpt_id);
 
-        bool ok = sc->load(ckpt_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
+        bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
         if (ok) {
             cache_hits_++;
             if (out_lcp) *out_lcp = match_lcp;
@@ -534,7 +541,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
     // with the state restoration setup in load().
     sc->prefetch(ckpt_id);
 
-    bool ok = sc->load(ckpt_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
+    bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
     if (ok) {
         cache_hits_++;
         if (out_lcp) *out_lcp = match_lcp;

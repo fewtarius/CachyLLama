@@ -30,7 +30,7 @@
 // Magic numbers
 static const uint32_t KV_SSD_MAGIC_INDEX = 0x4B564944; // "KVID"
 static const uint32_t KV_SSD_MAGIC_REC   = 0x4B565243; // "KVRC"
-static const uint32_t KV_SSD_VERSION     = 2;           // v2 = per-file format
+static const uint32_t KV_SSD_VERSION     = 3;           // v3 = per-file format + dft/spec blobs
 
 // =============================================================================
 // Internal helpers
@@ -136,7 +136,8 @@ static void ckpt_readahead(kv_ssd_cache* c, uint64_t id) {
         if (it->second.tier == KV_TIER_HOT || it->second.tier == KV_TIER_WARM) return;
 
         path = ckpt_path(c, id);
-        total_size = (off_t)(sizeof(kv_ssd_record) + (size_t)it->second.data_size);
+        total_size = (off_t)(sizeof(kv_ssd_record) + it->second.data_size
+                             + it->second.dft_data_size + it->second.spec_data_size);
         need_prefetch = true;
     }
     // Mutex released - path and total_size are local copies
@@ -150,7 +151,8 @@ static void ckpt_readahead(kv_ssd_cache* c, uint64_t id) {
     posix_fadvise(fd, 0, total_size, POSIX_FADV_WILLNEED);
 /// macOS does not expose readahead(); use fcntl(F_RDADVISE) instead.
 #elif defined(__APPLE__)
-    (void)fcntl(fd, F_RDADVISE, (void *)(intptr_t)total_size);
+    struct radvisory ra = { 0, (int)total_size };
+    fcntl(fd, F_RDADVISE, &ra);
 #endif
 
     close(fd);
@@ -221,6 +223,8 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
     ckpt.token_count = (size_t)rec.token_count;
     ckpt.tier = KV_TIER_COLD;
     ckpt.data_size = (size_t)rec.data_size;
+    ckpt.dft_data_size  = (size_t)rec.dft_data_size;
+    ckpt.spec_data_size = (size_t)rec.spec_data_size;
     ckpt.last_access = 0;
     ckpt.access_count = 0;
 
@@ -450,7 +454,8 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
     {
         int ra_fd = open(filepath.c_str(), O_RDONLY);
         if (ra_fd >= 0) {
-            size_t total = sizeof(kv_ssd_record) + (size_t)ckpt.data_size;
+            size_t total = sizeof(kv_ssd_record) + ckpt.data_size
+                           + ckpt.dft_data_size + ckpt.spec_data_size;
             posix_fadvise(ra_fd, 0, (off_t)total, POSIX_FADV_WILLNEED);
             close(ra_fd);
         }
@@ -472,26 +477,33 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
         return false;
     }
 
-    size_t data_size = (size_t)rec.data_size;
-    make_room_hot(c, data_size);
+    const size_t tgt_size  = (size_t)rec.data_size;
+    const size_t dft_size  = (size_t)rec.dft_data_size;
+    const size_t spec_size = (size_t)rec.spec_data_size;
+    const size_t total_blob = tgt_size + dft_size + spec_size;
+    make_room_hot(c, total_blob);
 
-    // Read checkpoint data (follows the record header)
-    std::vector<uint8_t> data(data_size);
-    if (!pread_all(fd, data.data(), data_size, (off_t)sizeof(kv_ssd_record))) {
+    // Read all blobs concatenated: [tgt_data][dft_data][spec_data]
+    std::vector<uint8_t> data(total_blob);
+    if (!pread_all(fd, data.data(), total_blob, (off_t)sizeof(kv_ssd_record))) {
         close(fd);
         return false;
     }
     close(fd);
 
+    // Update index split sizes in case they differed from what was recovered
+    ckpt.dft_data_size  = dft_size;
+    ckpt.spec_data_size = spec_size;
+
     c->hot_cache[id] = std::move(data);
-    c->hot_bytes += data_size;
+    c->hot_bytes += total_blob;
     ckpt.tier = KV_TIER_HOT;
     ckpt.last_access = now_ms();
     ckpt.access_count++;
     c->stats_loads++;
 
     LOG_INF("SSD cache: promoted checkpoint %lu cold->hot (%zu MiB)\n",
-            (unsigned long)id, data_size / 1024 / 1024);
+            (unsigned long)id, total_blob / 1024 / 1024);
     return true;
 }
 
@@ -597,7 +609,9 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   int32_t pos_min, int32_t pos_max,
                   uint64_t n_tokens, uint32_t turn_id,
                   const uint32_t* tokens, size_t tokens_size,
-                  uint64_t compat_hash)
+                  uint64_t compat_hash,
+                  const uint8_t* dft_data, size_t dft_data_size,
+                  const uint8_t* spec_data, size_t spec_data_size)
 {
     if (!cache || !cache->initialized || !data || data_size == 0) return 0;
 
@@ -627,8 +641,10 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     if (tokens && token_count > 0) {
         memcpy(rec.token_prefix, tokens, token_count * sizeof(uint32_t));
     }
+    rec.dft_data_size  = (dft_data  && dft_data_size  > 0) ? dft_data_size  : 0;
+    rec.spec_data_size = (spec_data && spec_data_size > 0) ? spec_data_size : 0;
 
-    // Write checkpoint file: header + data in one file
+    // Write checkpoint file: [header][tgt_data][dft_data][spec_data]
     std::string filepath = ckpt_path(cache, id);
     int fd = open(filepath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -638,12 +654,24 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     }
 
     bool ok = true;
-    if (!pwrite_all(fd, &rec, sizeof(rec), 0)) {
+    off_t off = 0;
+    if (!pwrite_all(fd, &rec, sizeof(rec), off)) {
         LOG_WRN("SSD cache: failed to write record header: %s\n", strerror(errno));
         ok = false;
     }
-    if (ok && !pwrite_all(fd, data, data_size, (off_t)sizeof(kv_ssd_record))) {
+    off += (off_t)sizeof(kv_ssd_record);
+    if (ok && !pwrite_all(fd, data, data_size, off)) {
         LOG_WRN("SSD cache: failed to write checkpoint data: %s\n", strerror(errno));
+        ok = false;
+    }
+    off += (off_t)data_size;
+    if (ok && rec.dft_data_size > 0 && !pwrite_all(fd, dft_data, rec.dft_data_size, off)) {
+        LOG_WRN("SSD cache: failed to write dft data: %s\n", strerror(errno));
+        ok = false;
+    }
+    off += (off_t)rec.dft_data_size;
+    if (ok && rec.spec_data_size > 0 && !pwrite_all(fd, spec_data, rec.spec_data_size, off)) {
+        LOG_WRN("SSD cache: failed to write spec data: %s\n", strerror(errno));
         ok = false;
     }
     fsync(fd);
@@ -658,12 +686,18 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     // Update index file with new next_id
     write_index_file(cache);
 
-    // Make room in hot tier
-    make_room_hot(cache, data_size);
+    // Build combined blob: [tgt_data][dft_data][spec_data]
+    const size_t total_blob = data_size + rec.dft_data_size + rec.spec_data_size;
+    make_room_hot(cache, total_blob);
 
-    // Store in hot cache
-    cache->hot_cache[id].assign(data, data + data_size);
-    cache->hot_bytes += data_size;
+    // Store combined blob in hot cache
+    std::vector<uint8_t> hot_blob;
+    hot_blob.reserve(total_blob);
+    hot_blob.assign(data, data + data_size);
+    if (rec.dft_data_size > 0) hot_blob.insert(hot_blob.end(), dft_data, dft_data + rec.dft_data_size);
+    if (rec.spec_data_size > 0) hot_blob.insert(hot_blob.end(), spec_data, spec_data + rec.spec_data_size);
+    cache->hot_cache[id] = std::move(hot_blob);
+    cache->hot_bytes += total_blob;
 
     // Build index entry
     kv_ssd_checkpoint ckpt;
@@ -681,7 +715,9 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     if (token_count > 0) {
         ckpt.token_prefix.assign(rec.token_prefix, rec.token_prefix + token_count);
     }
-    ckpt.data_size = data_size;
+    ckpt.data_size      = data_size;
+    ckpt.dft_data_size  = rec.dft_data_size;
+    ckpt.spec_data_size = rec.spec_data_size;
     ckpt.last_access = now_ms();
     ckpt.access_count = 1;
 
@@ -689,10 +725,12 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     cache->slot_latest[slot_id] = id;
     cache->stats_stores++;
 
-    LOG_INF("SSD cache: stored checkpoint %lu slot=%u tokens=%lu size=%zu MiB "
+    LOG_INF("SSD cache: stored checkpoint %lu slot=%u tokens=%lu tgt=%zu dft=%llu spec=%llu MiB "
             "(hot=%zu MiB warm=%zu MiB total=%zu)\n",
             (unsigned long)id, slot_id, (unsigned long)n_tokens,
             data_size / 1024 / 1024,
+            (unsigned long long)(rec.dft_data_size / 1024 / 1024),
+            (unsigned long long)(rec.spec_data_size / 1024 / 1024),
             cache->hot_bytes / 1024 / 1024,
             cache->warm_bytes / 1024 / 1024,
             cache->index.size());
@@ -701,7 +739,9 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
 }
 
 bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
-                 std::vector<uint8_t>& out_data)
+                 std::vector<uint8_t>& out_data,
+                 std::vector<uint8_t>* out_dft_data,
+                 std::vector<uint8_t>* out_spec_data)
 {
     if (!cache || !cache->initialized || checkpoint_id == 0) return false;
 
@@ -721,11 +761,33 @@ bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
         }
     }
 
+    // Helper: split combined blob [tgt][dft][spec] and populate output vectors
+    auto split_blob = [&](const std::vector<uint8_t>& blob, const kv_ssd_checkpoint& ckpt) {
+        out_data.assign(blob.begin(), blob.begin() + ckpt.data_size);
+        if (out_dft_data) {
+            if (ckpt.dft_data_size > 0) {
+                out_dft_data->assign(blob.begin() + ckpt.data_size,
+                                     blob.begin() + ckpt.data_size + ckpt.dft_data_size);
+            } else {
+                out_dft_data->clear();
+            }
+        }
+        if (out_spec_data) {
+            const size_t spec_off = ckpt.data_size + ckpt.dft_data_size;
+            if (ckpt.spec_data_size > 0) {
+                out_spec_data->assign(blob.begin() + spec_off,
+                                      blob.begin() + spec_off + ckpt.spec_data_size);
+            } else {
+                out_spec_data->clear();
+            }
+        }
+    };
+
     // Check hot cache
     auto hot_it = cache->hot_cache.find(checkpoint_id);
     if (hot_it != cache->hot_cache.end()) {
-        out_data = hot_it->second;
         auto& ckpt = cache->index[checkpoint_id];
+        split_blob(hot_it->second, ckpt);
         ckpt.last_access = now_ms();
         ckpt.access_count++;
         cache->stats_hits++;
@@ -735,7 +797,8 @@ bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
     // Check warm cache
     auto warm_it = cache->warm_cache.find(checkpoint_id);
     if (warm_it != cache->warm_cache.end()) {
-        out_data = warm_it->second;
+        auto& ckpt = cache->index[checkpoint_id];
+        split_blob(warm_it->second, ckpt);
         promote_to_hot(cache, checkpoint_id);
         cache->stats_hits++;
         return true;
@@ -745,7 +808,8 @@ bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
     if (promote_to_hot(cache, checkpoint_id)) {
         auto it = cache->hot_cache.find(checkpoint_id);
         if (it != cache->hot_cache.end()) {
-            out_data = it->second;
+            auto& ckpt = cache->index[checkpoint_id];
+            split_blob(it->second, ckpt);
             cache->stats_hits++;
             return true;
         }

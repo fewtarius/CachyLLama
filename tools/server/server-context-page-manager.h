@@ -62,16 +62,17 @@ public:
     // Store a checkpoint with token sequence for cross-slot matching
     // conv_hash routes to the correct per-conversation cache.
     // Creates the conversation directory automatically on first use.
-    // ctx is required to compute full state (recurrent + KV cache) for SSD storage
+    // ctx is required to compute full state (recurrent + KV cache) for SSD storage.
+    // ctx_dft is the MTP/draft context (nullptr if none or mem-shared).
     bool store_checkpoint_with_tokens(
         uint32_t slot_id,
         struct llama_context* ctx,
+        struct llama_context* ctx_dft,
         const common_prompt_checkpoint& ckpt,
         const llama_token* tokens,
         size_t tokens_size,
         uint32_t turn_id,
-        uint64_t conv_hash = 0
-        ,
+        uint64_t conv_hash = 0,
         const std::string& user_id = std::string()
     );
 
@@ -80,18 +81,22 @@ public:
         uint32_t slot_id,
         uint32_t turn_id,
         struct llama_context* ctx,
+        struct llama_context* ctx_dft,
         int32_t& out_pos_min,
         int32_t& out_pos_max,
-        uint64_t& out_n_tokens
+        uint64_t& out_n_tokens,
+        std::vector<uint8_t>* out_spec_data = nullptr
     );
 
     // Load a checkpoint by its SSD cache ID (for cross-slot restore)
     bool load_checkpoint_by_id(
         uint64_t checkpoint_id,
         struct llama_context* ctx,
+        struct llama_context* ctx_dft,
         int32_t& out_pos_min,
         int32_t& out_pos_max,
-        uint64_t& out_n_tokens
+        uint64_t& out_n_tokens,
+        std::vector<uint8_t>* out_spec_data = nullptr
     );
 
     // Prefetch checkpoints for a slot before processing
@@ -126,17 +131,19 @@ public:
         size_t tokens_size,
         uint32_t current_turn,
         struct llama_context* ctx,
+        struct llama_context* ctx_dft,
         int32_t& out_pos_min,
         int32_t& out_pos_max,
         uint64_t& out_n_tokens,
+        std::vector<uint8_t>* out_spec_data = nullptr,
         uint64_t conv_hash = 0,
-       int32_t n_past = -1,
-       uint64_t max_n_tokens = UINT64_MAX,
-       int32_t* out_lcp = nullptr,
-       float* out_overlap = nullptr,
-       bool* out_is_continuation = nullptr,
-       const std::string& user_id = std::string()
-   );
+        int32_t n_past = -1,
+        uint64_t max_n_tokens = UINT64_MAX,
+        int32_t* out_lcp = nullptr,
+        float* out_overlap = nullptr,
+        bool* out_is_continuation = nullptr,
+        const std::string& user_id = std::string()
+    );
 
    // Evict all checkpoints for a specific slot
     void evict_slot(uint32_t slot_id);

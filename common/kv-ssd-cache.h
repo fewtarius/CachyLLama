@@ -49,7 +49,9 @@ struct kv_ssd_checkpoint {
     uint64_t compat_hash;   // Model config hash (arch, dims, cache types)
     size_t token_count;     // Tokens in stored prefix
     kv_ssd_tier tier;       // Current tier
-    size_t data_size;       // Serialized checkpoint size in bytes
+    size_t data_size;       // Serialized tgt context size in bytes
+    size_t dft_data_size;   // Serialized MTP/draft context size (0 = none)
+    size_t spec_data_size;  // Serialized speculative impl state size (0 = none)
     uint64_t last_access;   // Timestamp ms of last access
     uint32_t access_count;  // Number of times accessed
     std::vector<uint32_t> token_prefix; // First N tokens for matching (cached in RAM)
@@ -68,6 +70,8 @@ struct kv_ssd_index_header {
 #define KV_SSD_TOKEN_PREFIX_MAX 4096
 
 // Per-checkpoint file header (fixed size, followed by checkpoint data)
+// v3 layout: [kv_ssd_record][tgt_data][dft_data][spec_data]
+// data_size = tgt bytes; dft_data_size/spec_data_size = optional extra blobs (0 = absent)
 struct kv_ssd_record {
     uint32_t magic;         // KV_SSD_MAGIC_REC
     uint32_t version;
@@ -77,11 +81,13 @@ struct kv_ssd_record {
     int32_t pos_max;
     uint64_t n_tokens;
     uint32_t turn_created;
-    uint64_t data_size;     // Checkpoint data bytes following this header
+    uint64_t data_size;     // tgt context bytes following this header
     uint64_t token_hash;    // Hash of full token sequence
     uint32_t token_count;   // Tokens stored in prefix array
     uint64_t compat_hash;   // Model config hash (arch, dims, cache types)
     uint32_t token_prefix[KV_SSD_TOKEN_PREFIX_MAX]; // First N tokens
+    uint64_t dft_data_size; // MTP/draft context bytes appended after tgt_data (0 = none)
+    uint64_t spec_data_size;// Speculative impl state bytes appended after dft_data (0 = none)
 };
 
 class kv_ssd_cache {
@@ -148,6 +154,7 @@ void kv_ssd_free(kv_ssd_cache* cache);
 
 // Store a checkpoint. Written to ckpt-{next_id}.bin immediately, kept in hot tier.
 // tokens/tokens_size used for hash-based matching (can be null/0).
+// dft_data/spec_data are optional extra blobs (MTP context and speculative impl state).
 // Returns checkpoint ID (>0) on success, 0 on failure.
 uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   uint32_t slot_id,
@@ -155,13 +162,18 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   int32_t pos_min, int32_t pos_max,
                   uint64_t n_tokens, uint32_t turn_id,
                   const uint32_t* tokens, size_t tokens_size,
-                  uint64_t compat_hash = 0);
+                  uint64_t compat_hash = 0,
+                  const uint8_t* dft_data = nullptr, size_t dft_data_size = 0,
+                  const uint8_t* spec_data = nullptr, size_t spec_data_size = 0);
 
 // Load a checkpoint by ID. Reads ckpt-{id}.bin and promotes to hot tier.
+// out_dft_data and out_spec_data receive the optional extra blobs if non-null.
 // Returns true and copies data to out_data on success.
 bool kv_ssd_load(kv_ssd_cache* cache,
                  uint64_t checkpoint_id,
-                 std::vector<uint8_t>& out_data);
+                 std::vector<uint8_t>& out_data,
+                 std::vector<uint8_t>* out_dft_data = nullptr,
+                 std::vector<uint8_t>* out_spec_data = nullptr);
 
 // Find best matching checkpoint by token prefix comparison.
 // Searches within this conversation's cache only.

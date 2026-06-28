@@ -2432,7 +2432,7 @@ private:
         if (ssd_page_manager) {
             const auto & prefix_tokens = slot.prompt.tokens;
             ssd_page_manager->store_checkpoint_with_tokens(
-                slot.id, ctx_tgt, cur,
+                slot.id, ctx_tgt, ctx_dft.get(), cur,
                 prefix_tokens.get_tokens().data(),
                 prefix_tokens.get_tokens().size(),
                 ssd_turn_counter, slot.conv_hash,
@@ -2482,7 +2482,7 @@ private:
                 ? slot.task->tokens.get_tokens()
                 : slot.prompt.tokens.get_tokens();
             ssd_page_manager->store_checkpoint_with_tokens(
-                slot.id, ctx_tgt, cur, prefix_tokens.data(),
+                slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
                 slot.task ? slot.task->user_id : std::string());
         }
@@ -3302,10 +3302,12 @@ private:
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
                                 uint64_t ssd_n_tokens = 0;
                                 int32_t ssd_lcp = 0;
+                                std::vector<uint8_t> ssd_spec_data;
                                 if (ssd_page_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
-                                        ssd_turn_counter, ctx_tgt,
+                                        ssd_turn_counter, ctx_tgt, ctx_dft.get(),
                                         ssd_pos_min, ssd_pos_max, ssd_n_tokens,
+                                        &ssd_spec_data,
                                         slot.conv_hash, 0, (uint64_t)task_tokens.size(), &ssd_lcp)) {
                                     // Push checkpoint's full token count.
                                     // ssd_lcp from find_match is capped at
@@ -3328,6 +3330,12 @@ private:
                                     // SSD restore already loaded full state.
                                     auto & ckpt = slot.prompt.checkpoints.emplace_back();
                                     ckpt.update_pos(n_push, 0, (llama_pos)n_push);
+
+                                    // Restore speculative impl state (pending_h for MTP)
+                                    // so the first draft after cold-start is consistent.
+                                    if (spec && !ssd_spec_data.empty()) {
+                                        common_speculative_set_state(spec.get(), slot.id, ssd_spec_data);
+                                    }
 
                                     // Flag that SSD cache restored this slot.
                                     slot.ssd_cold_start_used = true;
