@@ -211,6 +211,7 @@ struct server_slot {
     bool deferred_final_checkpoint = false;  // create final checkpoint after first token
     bool ssd_cold_start_used       = false;  // SSD cache restored for this slot on cold start
     uint64_t conv_hash             = 0;      // consistent conversation hash for all checkpoints
+    std::string user_id_;                        // identity of the owning task (for scheduling/affinity)
 
     stop_type stop;
 
@@ -315,6 +316,7 @@ struct server_slot {
         deferred_final_checkpoint = false;
         ssd_cold_start_used       = false;
         conv_hash                 = 0;
+        user_id_.clear();
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -873,6 +875,17 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // get the number of in-flight slots for a given user_id (used for
+    // per-user concurrency cap enforcement at the HTTP layer). Returns
+    // 0 for unknown users. Anonymous bucket uses the "_anonymous" key.
+    int get_active_user_count(const std::string & user_id) const {
+        if (params_base.max_concurrent_per_user <= 0) return 0;
+        const std::string bucket = user_id.empty() ? std::string("_anonymous") : user_id;
+        std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+        auto it = user_counts_.find(bucket);
+        return (it == user_counts_.end()) ? 0 : it->second;
+    }
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -1391,10 +1404,22 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
-                // SSD turn completion tracking
+                // SSD turn completion tracking + per-user concurrency release
                 for (auto & s : slots) {
                     if (s.id == id_slot) {
                         on_turn_complete(s);
+                        // Decrement the per-user active-slot counter so the
+                        // user can launch another request. Skip empty
+                        // user_id_ (anonymous bucket not tracked here).
+                        if (!s.user_id_.empty() && params_base.max_concurrent_per_user > 0) {
+                            std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+                            auto it = user_counts_.find(s.user_id_);
+                            if (it != user_counts_.end()) {
+                                if (--it->second <= 0) {
+                                    user_counts_.erase(it);
+                                }
+                            }
+                        }
                         break;
                     }
                 }
@@ -1697,6 +1722,23 @@ private:
 
         bool update_cache = false;
 
+        // Per-user concurrency cap. If the requesting user_id (or the
+        // _anonymous bucket for empty user_id) is already at the cap,
+        // refuse the slot. Caller is expected to handle nullptr (defer
+        // the task). The HTTP layer has a faster path that returns 429
+        // synchronously when the user is also over cap at queue time.
+        if (params_base.max_concurrent_per_user > 0) {
+            const std::string bucket = task.user_id.empty() ? std::string("_anonymous") : task.user_id;
+            std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+            auto it = user_counts_.find(bucket);
+            const int cur = (it == user_counts_.end()) ? 0 : it->second;
+            if (cur >= params_base.max_concurrent_per_user) {
+                SRV_INF("per-user concurrency cap hit for user_id='%s' (cur=%d, cap=%d)\n",
+                        bucket.c_str(), cur, params_base.max_concurrent_per_user);
+                return nullptr;
+            }
+        }
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1756,9 +1798,32 @@ private:
         if (ret == nullptr) {
             int64_t t_last = -1;
 
+            // Slot affinity: prefer slots already owned by the requesting
+            // user_id (cache-locality win) before falling back to LRU.
+            // An empty slot.user_id_ is unowned and fair game.
+            const bool want_affinity = !task.user_id.empty();
+            const std::string & want_user = task.user_id;
+
+            if (want_affinity) {
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing()) continue;
+                    if (!slot.user_id_.empty() && slot.user_id_ != want_user) continue;
+                    if (slot.prompt.n_tokens() == 0) continue;
+                    if (!ret || slot.t_last_used > t_last) {
+                        t_last = slot.t_last_used;
+                        ret = &slot;
+                    }
+                }
+            }
+
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                // skip slots owned by a different user (per-user isolation)
+                if (!slot.user_id_.empty() && !task.user_id.empty() && slot.user_id_ != task.user_id) {
                     continue;
                 }
 
@@ -1770,7 +1835,9 @@ private:
             }
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+                SLT_INF(*ret, "selected slot by LRU%s, t_last = %" PRId64 "\n",
+                        want_affinity && ret->user_id_ == want_user ? " (user_id affinity)" : "",
+                        t_last);
 
                 update_cache = true;
             }
@@ -1796,6 +1863,14 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            // Per-user concurrency accounting: only count tasks that bind
+            // a real user_id (anonymous requests don't participate in the
+            // cap; they're throttled by the global n_parallel pool).
+            if (params_base.max_concurrent_per_user > 0 && !task.user_id.empty()) {
+                std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+                user_counts_[task.user_id]++;
             }
         }
 
@@ -1956,6 +2031,7 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.user_id_ = slot.task->user_id; // remember owner for affinity + counter release
 
         // Compute conversation hash once from the full task tokens.
         // All checkpoints (mid-prompt and deferred) must use the same
@@ -3367,6 +3443,8 @@ private:
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
                                 uint64_t ssd_n_tokens = 0;
                                 int32_t ssd_lcp = 0;
+                                float ssd_overlap = 0.0f;
+                                bool ssd_is_continuation = false;
                                 std::vector<uint8_t> ssd_spec_data;
                                 if (ssd_page_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
@@ -3374,7 +3452,55 @@ private:
                                         (uint32_t)slot.id,
                                         ssd_pos_min, ssd_pos_max, ssd_n_tokens,
                                         &ssd_spec_data,
-                                        slot.conv_hash, 0, (uint64_t)task_tokens.size(), &ssd_lcp)) {
+                                        slot.conv_hash, 0, (uint64_t)task_tokens.size(),
+                                        &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
+                                        slot.task->user_id)) {
+                                    // Hybrid model LCP validation. Recurrent state is
+                                    // content-dependent - if the LCP is much smaller than
+                                    // the checkpoint's n_tokens, the recurrent state beyond
+                                    // the LCP is from a different conversation and will
+                                    // produce garbage logits (all -inf, sampler crash).
+                                    //
+                                    // Three cases:
+                                    //   1. lcp >= n_tokens: full coverage, recurrent state valid
+                                    //   2. lcp >= PREFIX_MAX (4096) AND overlap >= 99%:
+                                    //      same-conversation checkpoint with full prefix match
+                                    //   3. lcp < PREFIX_MAX: partial coverage, cap n_past to LCP
+                                    //
+                                    // For dense models the recurrent layer is replaced by full
+                                    // attention, so this gate is a no-op for them.
+                                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS
+                                            && ssd_lcp > 0 && ssd_n_tokens > 0) {
+                                        const uint64_t validated_tokens = std::min(
+                                            ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
+                                        const float MIN_LCP_RATIO = 0.80f;
+                                        float lcp_ratio = (float)ssd_lcp / (float)validated_tokens;
+                                        bool full_coverage =
+                                            ssd_lcp >= (int32_t)ssd_n_tokens ||
+                                            (ssd_lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX
+                                             && ssd_overlap >= 0.99f);
+                                        if (!full_coverage && lcp_ratio < MIN_LCP_RATIO) {
+                                            SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
+                                                    "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%, overlap=%.1f%%)\n",
+                                                    ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
+                                                    lcp_ratio * 100.0f, ssd_overlap * 100.0f);
+                                            // Clear the loaded state and reset
+                                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                            n_past = 0;
+                                            slot.prompt.tokens.clear();
+                                            ssd_n_tokens = 0;
+                                        } else if (!full_coverage) {
+                                            // Partial coverage: cap n_past to LCP so only
+                                            // validated recurrent state is used.
+                                            SLT_INF(slot, "SSD hybrid model partial-coverage: "
+                                                    "lcp=%d ssd_n_tokens=%lu cap to LCP\n",
+                                                    ssd_lcp, (unsigned long)ssd_n_tokens);
+                                            llama_memory_seq_rm_attn_only(
+                                                llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
+                                        }
+                                    }
+
+                                    if (ssd_n_tokens > 0) {
                                     // Push checkpoint's full token count.
                                     // ssd_lcp from find_match is capped at
                                     // KV_SSD_TOKEN_PREFIX_MAX (4096), but
@@ -3385,8 +3511,9 @@ private:
                                     for (int32_t i = 0; i < n_push; i++) {
                                         slot.prompt.tokens.push_back(task_tokens[i]);
                                     }
-                                    SLT_INF(slot, "SSD cache restore: lcp=%d ssd_n_tokens=%lu pos=[%d,%d] n_push=%d\n",
-                                            ssd_lcp, (unsigned long)ssd_n_tokens, ssd_pos_min, ssd_pos_max, n_push);
+                                    SLT_INF(slot, "SSD cache restore: lcp=%d ssd_n_tokens=%lu pos=[%d,%d] n_push=%d overlap=%.1f%% continuation=%d\n",
+                                            ssd_lcp, (unsigned long)ssd_n_tokens, ssd_pos_min, ssd_pos_max, n_push,
+                                            ssd_overlap * 100.0f, (int)ssd_is_continuation);
 
                                     // Create in-memory checkpoint so downstream
                                     // checkpoint search finds it. pos_min=0
@@ -3405,6 +3532,7 @@ private:
 
                                     // Flag that SSD cache restored this slot.
                                     slot.ssd_cold_start_used = true;
+                                    } // ssd_n_tokens > 0 (not rejected by hybrid LCP check)
                                 }
                             }
                         }
@@ -4487,8 +4615,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto & rd = res->rd;
     auto & params = this->params;
 
+    std::vector<server_task> tasks;
     try {
-        std::vector<server_task> tasks;
+        tasks.clear();
 
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
@@ -4538,6 +4667,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
 
+            // Operator-supplied user identity. The HTTP layer may also
+            // synthesize a tenant/user label via metadata->user_id; the
+            // raw field is the canonical CachyLLama form. Empty value is
+            // valid (anonymous bucket, no per-user cap).
+            try {
+                task.user_id = server_task::validate_user_id(
+                    json_value(data, "llama_user_id", std::string()));
+            } catch (const std::invalid_argument & e) {
+                throw std::invalid_argument(
+                    std::string("invalid llama_user_id: ") + e.what());
+            }
+
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
@@ -4558,6 +4699,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
+    }
+
+    // Per-user concurrency cap fast-fail (HTTP 429). After the request is
+    // queued, we can immediately tell if the user is over cap. The slow
+    // path (queue->get_available_slot returning nullptr) also enforces
+    // this, but the fast path saves a queue round-trip and a log of
+    // deferred tasks. We only check tasks carrying a non-empty user_id;
+    // anonymous requests are throttled only by the global n_parallel.
+    if (params.max_concurrent_per_user > 0) {
+        std::string first_user_id;
+        for (const auto & t : tasks) {
+            if (!t.user_id.empty()) {
+                first_user_id = t.user_id;
+                break;
+            }
+        }
+        if (!first_user_id.empty()) {
+            const int cur = ctx_server.get_active_user_count(first_user_id);
+            if (cur >= params.max_concurrent_per_user) {
+                res->error(format_error_response(
+                    "user '" + first_user_id + "' is at the per-user concurrency cap of " +
+                    std::to_string(params.max_concurrent_per_user) +
+                    " (currently " + std::to_string(cur) + " in-flight). " +
+                    "Retry after in-flight requests complete.",
+                    ERROR_TYPE_RATE_LIMIT));
+                return res;
+            }
+        }
     }
 
     bool stream = json_value(data, "stream", false);
