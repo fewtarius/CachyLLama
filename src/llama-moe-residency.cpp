@@ -14,8 +14,71 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <sys/mman.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#    include <io.h>
+#    include <windows.h>
+
+// Windows equivalent of getpagesize()
+static int getpagesize() {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return static_cast<int>(si.dwPageSize);
+}
+
+// Advice constants for madvise() on Windows
+#        ifndef MADV_WILLNEED
+#            define MADV_WILLNEED 1
+#        endif
+#        ifndef MADV_DONTNEED
+#            define MADV_DONTNEED 2
+#        endif
+#        ifndef MADV_FREE
+#            define MADV_FREE 3
+#        endif
+
+// No-op madvise() on Windows
+static int madvise(void *, size_t, int) {
+    // Windows has no direct equivalent; ignore advice
+    return 0;
+}
+#else
+#    include <sys/mman.h>
+#    include <unistd.h>
+#endif
+
+
+#ifdef _WIN32
+// Simple Windows helpers to mimic mmap/munmap for file-backed mappings
+static void * win_mmap_file(HANDLE hFile, size_t size, HANDLE * outMapHandle) {
+    if (!hFile || hFile == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(size), nullptr);
+    if (!hMap) {
+        return nullptr;
+    }
+    void * p = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    if (!p) {
+        CloseHandle(hMap);
+        return nullptr;
+    }
+    if (outMapHandle) {
+        *outMapHandle = hMap;
+    }
+    return p;
+}
+
+static void win_munmap(void * addr, HANDLE hMap) {
+    if (addr) {
+        UnmapViewOfFile(addr);
+    }
+    if (hMap && hMap != INVALID_HANDLE_VALUE) {
+        CloseHandle(hMap);
+    }
+}
+#endif
+
 
 // ---------------------------------------------------------------------------
 // Helpers

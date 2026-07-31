@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 fewtarius
 
+#ifdef _WIN32
+#    include <direct.h>
+#endif
+
 #include "llama-moe-coact.h"
 #include "llama.h"
 #include "llama-model.h"
@@ -167,18 +171,37 @@ std::vector<int32_t> predict_next_layer(
 
 std::string persistence_path(const std::string & model_path) {
     // Extract base name without path or extension.
-    std::string base = model_path;
-    auto slash = base.find_last_of("/\\");
-    if (slash != std::string::npos) base = base.substr(slash + 1);
+    std::string base  = model_path;
+    auto        slash = base.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        base = base.substr(slash + 1);
+    }
     auto dot = base.find_last_of('.');
-    if (dot != std::string::npos) base = base.substr(0, dot);
+    if (dot != std::string::npos) {
+        base = base.substr(0, dot);
+    }
 
     const char * home = std::getenv("HOME");
-    if (!home || !*home) home = "/tmp";
+    if (!home || !*home) {
+#ifdef _WIN32
+        home = std::getenv("TEMP");
+        if (!home || !*home) {
+            home = "C:\\Temp";
+        }
+#else
+        home = "/tmp";
+#endif
+    }
 
+#ifdef _WIN32
+    std::string dir = std::string(home) + "\\.cachylla\\coactivation";
+    _mkdir(dir.c_str());
+    return dir + "\\" + base + ".json";
+#else
     std::string dir = std::string(home) + "/.cachylla/coactivation";
     mkdir(dir.c_str(), 0755);
     return dir + "/" + base + ".json";
+#endif
 }
 
 bool save(const matrix & m, const std::string & path) {
