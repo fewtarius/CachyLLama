@@ -17,13 +17,22 @@
 
 #include "kv-ssd-cache.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
-#include <unistd.h>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -31,13 +40,22 @@
 
 namespace fs = std::filesystem;
 
+static int test_process_id() {
+#if defined(_WIN32)
+    return (int) GetCurrentProcessId();
+#else
+    return (int) getpid();
+#endif
+}
+
 static std::string make_temp_dir(const std::string & tag) {
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "/tmp/cachyllama-ssd-test-%s-%d",
-                  tag.c_str(), (int) getpid());
-    fs::remove_all(buf);
-    fs::create_directories(buf);
-    return std::string(buf);
+    std::snprintf(buf, sizeof(buf), "cachyllama-ssd-test-%s-%d",
+                  tag.c_str(), test_process_id());
+    const std::string dir = (fs::temp_directory_path() / buf).string();
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    return dir;
 }
 
 static uint64_t random_conv_hash() {

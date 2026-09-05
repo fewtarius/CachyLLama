@@ -301,8 +301,11 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-kv-ssd-user-isolation.cpp)
-llama_build_and_test(test-moe-residency-routing.cpp)
-target_include_directories(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # disabled on Windows because it uses internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-moe-residency-routing.cpp)
+    target_include_directories(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 

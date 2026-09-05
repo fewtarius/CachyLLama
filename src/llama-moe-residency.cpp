@@ -16,8 +16,64 @@
 #include <cmath>
 #include <cstring>
 #include <cerrno>
+
+#if defined(_WIN32)
+// Windows has no madvise(); the calls below map onto the closest Win32
+// working-set hints. WILLNEED becomes PrefetchVirtualMemory (pages the
+// range in from the file), COLD/DONTNEED become VirtualUnlock, which
+// trims the range from the process working set without invalidating the
+// file-backed copy - the same non-destructive semantics MADV_COLD has.
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#define MADV_WILLNEED 3
+#define MADV_DONTNEED 4
+#define MADV_COLD     20
+
+static int getpagesize(void) {
+    static int page_size = 0;
+    if (page_size == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        page_size = (int) si.dwPageSize;
+    }
+    return page_size;
+}
+
+static int madvise(void * addr, size_t len, int advice) {
+    switch (advice) {
+        case MADV_WILLNEED:
+            {
+                WIN32_MEMORY_RANGE_ENTRY range;
+                range.VirtualAddress = addr;
+                range.NumberOfBytes  = len;
+                if (!PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                return 0;
+            }
+        case MADV_COLD:
+        case MADV_DONTNEED:
+            // VirtualUnlock on a range that was never VirtualLock'd still
+            // trims it from the working set and reports ERROR_NOT_LOCKED.
+            if (!VirtualUnlock(addr, len) && GetLastError() != ERROR_NOT_LOCKED) {
+                errno = EINVAL;
+                return -1;
+            }
+            return 0;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Helpers

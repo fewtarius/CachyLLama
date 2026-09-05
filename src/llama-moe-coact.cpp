@@ -15,6 +15,15 @@
 #include <sstream>
 #include <sys/stat.h>
 
+#if defined(_WIN32)
+#include <direct.h>
+#define LLAMA_COACT_HOME_DIR "USERPROFILE"
+#define llama_coact_mkdir(p) _mkdir(p)
+#else
+#define LLAMA_COACT_HOME_DIR "HOME"
+#define llama_coact_mkdir(p) mkdir(p, 0755)
+#endif
+
 namespace llama_moe_coact {
 
 void init(matrix & m, const struct llama_model & model) {
@@ -173,11 +182,21 @@ std::string persistence_path(const std::string & model_path) {
     auto dot = base.find_last_of('.');
     if (dot != std::string::npos) base = base.substr(0, dot);
 
-    const char * home = std::getenv("HOME");
-    if (!home || !*home) home = "/tmp";
+    const char * home = std::getenv(LLAMA_COACT_HOME_DIR);
+    if (!home || !*home) {
+#if defined(_WIN32)
+        home = std::getenv("TEMP");
+        if (!home || !*home) home = ".";
+#else
+        home = "/tmp";
+#endif
+    }
 
-    std::string dir = std::string(home) + "/.cachylla/coactivation";
-    mkdir(dir.c_str(), 0755);
+    // mkdir() is not recursive, so create the parent first.
+    const std::string parent = std::string(home) + "/.cachylla";
+    const std::string dir    = parent + "/coactivation";
+    llama_coact_mkdir(parent.c_str());
+    llama_coact_mkdir(dir.c_str());
     return dir + "/" + base + ".json";
 }
 
