@@ -22,13 +22,19 @@
 // working-set hints. WILLNEED becomes PrefetchVirtualMemory (pages the
 // range in from the file), COLD/DONTNEED become VirtualUnlock, which
 // trims the range from the process working set without invalidating the
-// file-backed copy - the same non-destructive semantics MADV_COLD has.
+// file-backed copy - a non-destructive approximation of MADV_COLD's
+// page-level reclaim hint. VirtualUnlock is a coarser, process-wide
+// mechanism and is a no-op (returns ERROR_NOT_LOCKED, which the shim
+// treats as success) on memory that was never VirtualLock'd.
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 
+// Mirror the Linux <sys/mman.h> values so the call sites in this file
+// use the same symbols on both platforms. Windows headers do not define
+// MADV_*, hence the explicit redeclaration here.
 #define MADV_WILLNEED 3
 #define MADV_DONTNEED 4
 #define MADV_COLD     20
@@ -58,8 +64,10 @@ static int madvise(void * addr, size_t len, int advice) {
             }
         case MADV_COLD:
         case MADV_DONTNEED:
-            // VirtualUnlock on a range that was never VirtualLock'd still
-            // trims it from the working set and reports ERROR_NOT_LOCKED.
+            // VirtualUnlock on a range that was never VirtualLock'd is
+            // effectively a no-op and reports ERROR_NOT_LOCKED, which we
+            // treat as success (matches the Linux "best-effort hint"
+            // contract for these advice values on file-backed mmaps).
             if (!VirtualUnlock(addr, len) && GetLastError() != ERROR_NOT_LOCKED) {
                 errno = EINVAL;
                 return -1;
