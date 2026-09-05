@@ -125,6 +125,20 @@ struct llama_moe_residency_state {
     uint64_t advice_failure       = 0;
     uint64_t advice_einval        = 0;
     uint64_t invalid_mapping      = 0;
+
+    // Circuit breaker: when the first madvise() call returns ENOMEM, the
+    // kernel is telling us the system is under memory pressure and can't
+    // honor advisory hints. On UMA APUs (Flip 7840U, Strix) where the
+    // model file is mmap'd into the GPU-visible budget (VRAM+GTT shares
+    // DRAM), this is the steady-state for a model that fills most of
+    // the budget. Issuing further madvise() calls is pure syscall
+    // overhead with no benefit, so we set madvise_disabled_due_to_pressure
+    // and skip future calls. The LRU software policy still tracks
+    // touches/evictions for observability, but the kernel is left to
+    // manage the page cache on its own. Cleared on release() so a
+    // rebuilt state can re-attempt.
+    bool madvise_disabled_due_to_pressure = false;
+    uint64_t pressure_failure_count = 0;  // ENOMEM count before breaker tripped
 };
 
 // Build the residency state from a loaded MoE model. Returns true and

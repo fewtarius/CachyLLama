@@ -1738,6 +1738,14 @@ extern "C" {
         // the eviction path. Kept here for observability, not for callers
         // to branch on.
         bool     uses_madv_cold;
+        // True if the residency layer tripped its madvise circuit
+        // breaker because the kernel returned ENOMEM. Once tripped, no
+        // further madvise() calls are issued for this context - the LRU
+        // still tracks expert usage, but the kernel manages the page
+        // cache on its own. This is the steady state on UMA APUs (Flip
+        // 7840U, Strix) where the model is mmap'd into VRAM+GTT and
+        // there is no headroom for advisory page-cache hints.
+        bool     madvise_disabled_due_to_pressure;
     };
 
     LLAMA_API void llama_moe_residency_stats_get(

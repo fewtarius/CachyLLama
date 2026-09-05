@@ -139,15 +139,30 @@ static int find_evict_slot(const std::vector<llama_moe_layer_residency_internal:
 // separately because it is the most common failure mode for advice
 // values not applicable to the current mapping (e.g. MADV_FREE on a
 // MAP_SHARED file-backed mapping - invalid per the Linux man page).
+//
+// `st` (may be null) is the residency state, used to trip the
+// madvise circuit breaker on the first ENOMEM. Once tripped, subsequent
+// madvise calls are skipped to avoid wasting syscalls under sustained
+// memory pressure (the steady state on UMA APUs that mmap the model
+// into VRAM+GTT).
 static void safe_madvise(void * base, size_t len, int advice,
                          const char * advice_name,
                          uint64_t & c_success,
                          uint64_t & c_failure,
                          uint64_t & c_einval,
                          uint64_t & c_invalid_map,
-                         bool log_failures) {
+                         bool log_failures,
+                         llama_moe_residency_state * st) {
     if (!base || len == 0) {
         c_invalid_map++;
+        return;
+    }
+    // Circuit breaker: skip the syscall if a previous ENOMEM told us the
+    // system is under pressure. The LRU still tracks the touch for
+    // observability, but we don't burn cycles on madvise() that the
+    // kernel can't honor.
+    if (st && st->madvise_disabled_due_to_pressure) {
+        c_failure++;
         return;
     }
     uintptr_t p = reinterpret_cast<uintptr_t>(base);
@@ -167,6 +182,22 @@ static void safe_madvise(void * base, size_t len, int advice,
     int e = errno;
     c_failure++;
     if (e == EINVAL) c_einval++;
+    // ENOMEM trips the circuit breaker. The kernel is telling us it
+    // can't honor this advisory hint - either the system is under
+    // pressure, or the region is too large to track. Either way,
+    // further madvise() calls on the same state are pure overhead.
+    if (e == ENOMEM && st) {
+        st->pressure_failure_count++;
+        if (!st->madvise_disabled_due_to_pressure) {
+            st->madvise_disabled_due_to_pressure = true;
+            LLAMA_LOG_WARN(
+                "moe-residency: madvise(%s) returned ENOMEM; disabling further "
+                "madvise() calls to avoid syscall overhead under memory pressure. "
+                "The LRU policy continues to track expert usage for observability; "
+                "the kernel will manage the page cache on its own.\n",
+                advice_name ? advice_name : "?");
+        }
+    }
     if (log_failures) {
         LLAMA_LOG_WARN(
             "moe-residency: madvise(%s) failed: addr=%p len=%zu errno=%d (%s)\n",
@@ -322,7 +353,7 @@ void llama_moe_residency_touch(
                              stride, MADV_COLD, "MADV_COLD",
                              st->advice_success, st->advice_failure,
                              st->advice_einval, st->invalid_mapping,
-                             st->cfg.log_advice_failures);
+                             st->cfg.log_advice_failures, st);
             });
             st->total_evicted++;
         }
@@ -347,7 +378,7 @@ void llama_moe_residency_touch(
                      stride, MADV_WILLNEED, "MADV_WILLNEED",
                      st->advice_success, st->advice_failure,
                      st->advice_einval, st->invalid_mapping,
-                     st->cfg.log_advice_failures);
+                     st->cfg.log_advice_failures, st);
     });
 }
 
@@ -413,14 +444,29 @@ void llama_moe_residency_prewarm(
             lr.slot_of[expert_id] = slot;
             st->total_touched++;
 
-            const size_t off = (size_t) expert_id;
-            for_each_tensor(lr, [&](void * base, size_t stride) {
-                safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
-                             stride, MADV_WILLNEED, "MADV_WILLNEED",
-                             st->advice_success, st->advice_failure,
-                             st->advice_einval, st->invalid_mapping,
-                             st->cfg.log_advice_failures);
-            });
+            // Intentionally do NOT issue MADV_WILLNEED here.
+            //
+            // Pre-faulting the top-K expert pages at startup means the
+            // kernel has to allocate page cache for K * 3 tensors * n_layer
+            // regions (e.g. 8 * 3 * 40 = 960 for a 40-layer MoE) all at
+            // once, on regions the user has not yet accessed. On UMA APUs
+            // (Flip 7840U, Strix) where the model file is mmap'd into the
+            // GPU-visible budget (VRAM+GTT shares DRAM), this overflows
+            // the kernel's free pages and the madvise calls fail with
+            // ENOMEM (errno 12). The model then either OOMs at load or
+            // runs with every expert page-cold and page-faults on every
+            // token - the exact regression residency is supposed to
+            // prevent.
+            //
+            // The right behavior is to install the LRU slots and let
+            // natural page faults on first inference page the experts
+            // in. The slot is marked occupied with loaded_at = now and
+            // access_count = 0, so the first touch() is a "hit" in the
+            // software policy (the policy thinks the expert is loaded)
+            // and the kernel serves the page from disk-backed mmap.
+            // On memory-rich systems (Halo, large VRAM) the kernel will
+            // keep these pages hot anyway because nothing else competes
+            // for the page cache.
         }
     }
 }
@@ -441,13 +487,17 @@ void llama_moe_residency_release(
                              stride, MADV_DONTNEED, "MADV_DONTNEED",
                              st->advice_success, st->advice_failure,
                              st->advice_einval, st->invalid_mapping,
-                             st->cfg.log_advice_failures);
+                             st->cfg.log_advice_failures, st);
             });
             e.occupied = false;
         }
         for (auto & s : lr.slot_of) s = -1;
     }
     st->layers.clear();
+    // Reset the breaker so a rebuilt state can re-attempt. The OS memory
+    // state may have changed between releases.
+    st->madvise_disabled_due_to_pressure = false;
+    st->pressure_failure_count = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -468,11 +518,18 @@ void llama_moe_residency_log_stats(
     // Note: hit_rate is the SOFTWARE POLICY hit rate, not physical residency.
     // advice_einval counts madvise calls the kernel rejected (e.g. on
     // mapping types that don't support the advice). If einval > 0 here
-    // the policy is not actually doing anything.
-    LLAMA_LOG_INFO(
+    // the policy is not actually doing anything. madvise_pressure=true
+    // means the circuit breaker tripped - the LRU still tracks usage
+    // but the kernel manages the page cache on its own.
+    // Use LLAMA_LOG_WARN instead of LLAMA_LOG_INFO because ggml's
+    // GGML_LOG_LEVEL_INFO maps to LOG_LEVEL_TRACE (4) in the common
+    // log system, which is filtered out at the default verbosity (3).
+    // WARN maps to LOG_LEVEL_WARN (2) which passes the threshold.
+    LLAMA_LOG_WARN(
         "moe-residency: decodes=%llu touches=%llu policy_hits=%llu policy_misses=%llu "
         "evictions=%llu policy_hit_rate=%.1f%% "
-        "madvise: ok=%llu fail=%llu einval=%llu invalid_map=%llu ok_ratio=%.1f%%\n",
+        "madvise: ok=%llu fail=%llu einval=%llu invalid_map=%llu ok_ratio=%.1f%% "
+        "madvise_pressure=%s pressure_failures=%llu\n",
         (unsigned long long) st->decode_count,
         (unsigned long long) st->total_touched,
         (unsigned long long) st->total_hits,
@@ -483,7 +540,9 @@ void llama_moe_residency_log_stats(
         (unsigned long long) st->advice_failure,
         (unsigned long long) st->advice_einval,
         (unsigned long long) st->invalid_mapping,
-        advice_ok * 100.0);
+        advice_ok * 100.0,
+        st->madvise_disabled_due_to_pressure ? "true" : "false",
+        (unsigned long long) st->pressure_failure_count);
 }
 
 // ---------------------------------------------------------------------------
