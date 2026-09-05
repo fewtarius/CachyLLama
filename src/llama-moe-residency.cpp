@@ -647,3 +647,56 @@ int llama_moe_residency_debug_sample(
 }
 
 #endif
+
+// ---------------------------------------------------------------------------
+// Test-only public wrappers
+// ---------------------------------------------------------------------------
+// Expose the same call shape as the internal madvise/getpagesize helpers so
+// the test suite can exercise the platform shim without depending on the
+// internal counter plumbing. Production callers go through safe_madvise()
+// above, which adds page alignment, EINVAL tracking, and per-advice
+// counter updates.
+
+int llama_moe_residency_madvise(void * addr, size_t len, int advice) {
+#if defined(_WIN32)
+    switch (advice) {
+        case MADV_WILLNEED:
+            {
+                WIN32_MEMORY_RANGE_ENTRY range;
+                range.VirtualAddress = addr;
+                range.NumberOfBytes  = len;
+                if (!PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                return 0;
+            }
+        case MADV_COLD:
+        case MADV_DONTNEED:
+            if (!VirtualUnlock(addr, len) && GetLastError() != ERROR_NOT_LOCKED) {
+                errno = EINVAL;
+                return -1;
+            }
+            return 0;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+#else
+    return ::madvise(addr, len, advice);
+#endif
+}
+
+int llama_moe_residency_pagesize(void) {
+#if defined(_WIN32)
+    static int page_size = 0;
+    if (page_size == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        page_size = (int) si.dwPageSize;
+    }
+    return page_size;
+#else
+    return ::getpagesize();
+#endif
+}

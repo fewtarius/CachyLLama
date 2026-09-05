@@ -197,3 +197,24 @@ bool llama_moe_residency_topk_from_stats(
 int llama_moe_residency_debug_sample(
         const struct llama_moe_residency_state * st,
         int max_pages_per_tensor);
+
+// Platform-agnostic madvise wrapper. Returns 0 on success, -1 on failure
+// with errno set. `advice` accepts the MADV_WILLNEED / MADV_DONTNEED /
+// MADV_COLD symbols from <sys/mman.h> on Linux; on Windows the
+// implementation maps them onto PrefetchVirtualMemory / VirtualUnlock
+// as a non-destructive approximation.
+//
+// The enum values mirror the Linux <sys/mman.h> constants so the same
+// advice integer works on both platforms. Callers in production pass
+// the standard MADV_* symbols (provided by <sys/mman.h> on Linux and
+// by an internal shim on Windows) - the enum is for the test suite.
+enum llama_moe_residency_advice {
+    LLAMA_MOE_RESIDENCY_MADV_WILLNEED = 3,  // mirror Linux MADV_WILLNEED
+    LLAMA_MOE_RESIDENCY_MADV_DONTNEED = 4,  // mirror Linux MADV_DONTNEED
+    LLAMA_MOE_RESIDENCY_MADV_COLD     = 20, // mirror Linux MADV_COLD
+};
+LLAMA_API int llama_moe_residency_madvise(void * addr, size_t len, int advice);
+
+// Returns the OS page size in bytes. Wrapper around getpagesize() that
+// works on both POSIX and Windows. Exposed for the test suite.
+LLAMA_API int llama_moe_residency_pagesize(void);

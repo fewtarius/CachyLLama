@@ -301,6 +301,12 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-kv-ssd-user-isolation.cpp)
+# Test-only wrappers in src/llama-moe-residency.h are declared LLAMA_API,
+# so this test links against libllama directly and runs on all platforms
+# including Windows+shared. Exercises the platform-agnostic madvise shim
+# (real madvise on Linux, PrefetchVirtualMemory/VirtualUnlock on Windows).
+llama_build_and_test(test-madvise-shim.cpp)
+target_include_directories(test-madvise-shim PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # disabled on Windows because it uses internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-moe-residency-routing.cpp)
