@@ -1,27 +1,21 @@
 # AGENTS.md
 
-Technical reference for CachyLLama development.
-
-**Version:** 2.0
-**Date:** 2026-08-15
-**Purpose:** Development conventions, build, testing, and architecture for the
-CachyLLama fork of llama.cpp. For project methodology (the Unbroken Method,
-checkpoint workflow, session handoff), see `.clio/instructions.md`.
+**Version:** 3.0
+**Date:** 2026-09-05
+**Purpose:** Technical reference for CachyLLama development (methodology in `.clio/instructions.md`)
 
 ---
 
-## Project overview
+## Project Overview
 
-CachyLLama is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
-focused on performance optimization for AMD APU hardware. It tracks upstream
-master through periodic merges, then carries its own divergent work on top.
+**CachyLLama** is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) focused on performance optimization for AMD APU hardware. It tracks upstream master through periodic merges, then layers on its own divergent work.
 
-- **Languages:** C11 (ggml core), C++17 (llama engine, common utilities), GLSL
-  (Vulkan shaders), Python (conversion scripts, GGUF tooling)
+- **Languages:** C11 (ggml core), C++17 (llama engine, common utilities), GLSL (Vulkan shaders), Python (conversion scripts, GGUF tooling)
 - **Build system:** CMake 3.14+
-- **Architecture:** Modular C library with multi-backend hardware acceleration
-  (CPU, Vulkan, CUDA, Metal, HIP, etc.) plus CachyLLama-specific subsystems
-- **License:** MIT (same as upstream, Copyright (c) 2023-2026 The ggml authors)
+- **Architecture:** Modular C library with multi-backend hardware acceleration (CPU, Vulkan, CUDA, Metal, HIP, etc.) plus CachyLLama-specific subsystems
+- **License:** MIT (same as upstream `llama.cpp`, Copyright (c) 2023-2026 The ggml authors)
+- **Upstream:** <https://github.com/ggml-org/llama.cpp>
+- **Parent project:** [fewtarius/llama-ai](https://github.com/fewtarius/llama-ai) — runner scripts, GPU detection, benchmark harness
 
 ### CachyLLama-specific subsystems
 
@@ -42,36 +36,16 @@ master through periodic merges, then carries its own divergent work on top.
 | Host RAM utility | `common/host-ram.h`, `common/host-ram.cpp` | Cross-platform available-RAM query |
 | Vulkan FA scratch gate | `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | Quantized-KV FA dequant-once with host-RAM safety check |
 
-### Key third-party carries (not upstreamed, CachyLLama-specific)
-
-| Feature | Source | Files |
-|---------|--------|-------|
-| DeepSeek-V4 Lightning Indexer | CachyLLama original | `vulkan-shaders/lightning_indexer*.comp` |
-| DSV4 hyper-connection fused ops | [ggml-org/llama.cpp#26578](https://github.com/ggml-org/llama.cpp/pull/26578) | `vulkan-shaders/dsv4_hc_*.comp` |
-| Concat transpose shader | Nathanw1014 carry | `vulkan-shaders/concat_transpose.comp` |
-| MMID row-lists prepass | Nathanw1014 carry | `vulkan-shaders/mmid_row_lists.comp` |
-| FA dequant-once scratch | [Nathanw1014/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494) | `ggml-vulkan.cpp`, `vulkan-shaders/dequant_*.comp` |
-| APU `nodes_per_submit` auto-lower | CachyLLama original | `ggml/src/ggml-vulkan/ggml-vulkan.cpp` |
-| Subgroup size pinning | Nathanw1014 carry | `ggml/src/ggml-vulkan/ggml-vulkan.cpp` |
-| ROCm RDNA3.5 Strix Halo tuning | gaetan-puleo carry | `ggml/src/ggml-cuda/mmq-config-rdna3_5.cuh` |
-
-See the [patch-set table](#patch-set-table) below for upstream status and
-CachyLLama-specific additions for each carry.
-
 ---
 
-## Quick setup
+## Quick Setup
 
 ```bash
 # Clone (with submodules for ggml)
 git clone --recurse-submodules https://github.com/fewtarius/CachyLLama.git
 cd CachyLLama
 
-# Build (Vulkan on Linux, Metal on macOS, default CPU)
-cmake -B build
-cmake --build build --config Release -j$(nproc)
-
-# Build with Vulkan (default on Linux AMD)
+# Build (Vulkan on Linux AMD, Metal on macOS, default CPU elsewhere)
 cmake -B build -DGGML_VULKAN=ON
 cmake --build build --config Release -j$(nproc)
 
@@ -80,13 +54,9 @@ cmake --build build --config Release -j$(nproc)
 
 # Run CLI chat
 ./build/bin/llama-cli -m /path/to/model.gguf
-
 ```
 
-> **Note:** For end-to-end usage (runner scripts, GPU detection, benchmark
-> harness, GTT configuration), use the
-> [parent project](https://github.com/fewtarius/llama-ai) which builds
-> CachyLLama with the right cmake flags automatically.
+> For end-to-end usage (runner scripts, GPU detection, benchmark harness, GTT configuration), use the [parent project](https://github.com/fewtarius/llama-ai) which builds CachyLLama with the right cmake flags automatically.
 
 ---
 
@@ -99,18 +69,17 @@ cmake --build build --config Release -j$(nproc)
                           |
     +----------+----------+----------+----------+----------+
     |          |          |          |          |          |
-    src/       src/       src/       src/       src/       src/
-    llama-     llama-     llama-     llama-     llama-     models/
-    model      context    sampler    kv-cache   memory     (per-arch)
-    src/                        src/llama-moe-
-    llama-                      residency.cpp
-    chat.cpp                    llama-moe-coact.cpp
-    common/                     common/kv-ssd-*.cpp
-    (utilities)                 common/kv_page_manager.cpp
-    common/host-ram.{h,cpp}     common/kv-ssd-system-cache.cpp
-    common/arg.cpp              common/preset.cpp
-    common/sampling.cpp         common/reasoning-budget.cpp
-    ggml/ (Tensor library — Git submodule)
+   src/       src/       src/       src/       src/       src/models/
+   llama-     llama-     llama-     llama-     llama-     (per-arch)
+   model      context    sampler    kv-cache   memory
+    |                        src/llama-moe-residency.cpp
+   common/                   src/llama-moe-coact.cpp
+   (utilities)               common/kv-ssd-*.cpp
+   common/host-ram.{h,cpp}   common/kv_page_manager.cpp
+   common/arg.cpp            common/kv-ssd-system-cache.cpp
+   common/sampling.cpp       common/preset.cpp
+                             common/reasoning-budget.cpp
+    ggml/ (Tensor library, Git submodule)
     |
     +----+----+----+----+----+----+----+----+
     |    |    |    |    |    |    |    |    |
@@ -124,7 +93,7 @@ cmake --build build --config Release -j$(nproc)
 | `include/llama.h` | Public C API (includes CachyLLama extensions: MoE tracking, residency, user isolation) |
 | `src/llama.cpp` | Core API implementation |
 | `src/llama-model.cpp` | Model loading, architecture dispatch |
-| `src/llama-context.cpp` | Inference context, graph evaluation |
+| `src/llama-context.cpp` | Inference context, graph evaluation, expert activation tracking, residency touch hook |
 | `src/llama-kv-cache*.cpp` | KV cache implementations (standard, ISWA, MSA, DSV4, DSA, recurrent) |
 | `src/llama-memory*.cpp` | Memory types (hybrid, recurrent, hybrid-iswa) |
 | `src/llama-moe-residency.cpp` | MoE expert residency management |
@@ -162,12 +131,14 @@ cmake --build build --config Release -j$(nproc)
 | `docs/` | Documentation (build guides, architecture, development) |
 | `cmake/` | CMake modules and helpers |
 | `ci/` | CI run scripts |
+| `app/` | Unified `llama` binary target (intentionally not built in the default CachyLLama configuration) |
+| `reference/` | Gitignored. Vendored reference checkouts for diff/audit (upstream `llama.cpp`, `strix-halo-llamacpp`) |
 
 ---
 
-## Code style
+## Code Style
 
-**C/C++ conventions** (same as upstream llama.cpp — do not deviate):
+CachyLLama follows upstream `llama.cpp` conventions — do not deviate.
 
 - **C++17** standard, **C11** for ggml core
 - **4 spaces** indentation, no tabs
@@ -183,28 +154,21 @@ cmake --build build --config Release -j$(nproc)
 - Avoid templates, fancy STL constructs — use basic `for` loops
 - Keep it simple, minimal dependencies
 
-**Formatting:** Use `.clang-format` (clang-tools v15+) when in doubt. The
-project has a comprehensive `.clang-format` config at the root.
+**Formatting:** Use `.clang-format` (clang-tools v15+) when in doubt.
 
-**EditorConfig:** Root `.editorconfig` enforces: spaces, indent 4, LF, UTF-8,
-trailing whitespace trimmed.
+**EditorConfig:** Root `.editorconfig` enforces: spaces, indent 4, LF, UTF-8, trailing whitespace trimmed.
 
-**CachyLLama-specific conventions:**
+### CachyLLama-specific conventions
 
-- CachyLLama additions are marked with `SPDX-License-Identifier: GPL-3.0-or-later`
-  and `Copyright (c) 2026 fewtarius` at the top of each file
-- Vulkan shader dispatch code that is env-gated should use the `GGML_VK_DISABLE_*`
-  / `GGML_VK_*` naming convention
-- CachyLLama C API functions in `include/llama.h` should use the `llama_` prefix
-  and be grouped with other CachyLLama extensions (after the upstream API section)
-- MoE-related code should reference `docs/moe-expert-residency.md` for
-  architecture context
-- Do **not** write `Assisted-by:` in commit messages — this is a fork, commits
-  go directly to the CachyLLama git history
+- CachyLLama additions are marked with `SPDX-License-Identifier: GPL-3.0-or-later` and `Copyright (c) 2026 fewtarius` at the top of each file
+- Vulkan shader dispatch code that is env-gated should use the `GGML_VK_DISABLE_*` / `GGML_VK_*` naming convention
+- CachyLLama C API functions in `include/llama.h` should use the `llama_` prefix and be grouped with other CachyLLama extensions (after the upstream API section)
+- MoE-related code should reference `docs/moe-expert-residency.md` for architecture context
+- **Do not** write `Assisted-by:` in commit messages — this is a fork, commits go directly to the CachyLLama git history
 
 ---
 
-## Module naming conventions
+## Module Naming Conventions
 
 | Prefix | Purpose | Examples |
 |--------|---------|----------|
@@ -222,14 +186,14 @@ Source files follow the pattern: `src/llama-{module}.cpp` / `src/llama-{module}.
 ### C++ unit tests (CTest)
 
 ```bash
-# Build with tests enabled (default for standalone builds)
 cmake -B build -DLLAMA_BUILD_TESTS=ON
 cmake --build build -j$(nproc)
-
-# Run all tests
 cd build && ctest --output-on-failure
+```
 
-# Run specific test binaries
+Run a specific test binary:
+
+```bash
 ./build/bin/test-backend-ops
 ./build/bin/test-sampling
 ./build/bin/test-tokenizer-0
@@ -248,40 +212,34 @@ cd build && ctest --output-on-failure
 
 ### Vulkan shader testing
 
-The Lightning Indexer shader is validated by `test-backend-ops` on Strix Halo
-(gfx1151, RDNA3.5, Vulkan 1.4, RADV Mesa 26.2). Before changing
-`lightning_indexer.comp` or its dispatch in `ggml-vulkan.cpp`:
+The Lightning Indexer shader is validated by `test-backend-ops` on Strix Halo (gfx1151, RDNA3.5, Vulkan 1.4, RADV Mesa 26.2). Before changing `lightning_indexer.comp` or its dispatch in `ggml-vulkan.cpp`:
 
-1. Run `test-backend-ops` and verify 108/108 pass (was 0/108 before the init-order
-   fix — see [init-order note](#vulkan-init-order-critical-lightning-indexer-and-dsv4-hc))
-2. Test with DeepSeek-V4-Flash IQ3_XXS on a RADV APU to confirm no
-   "Lightning Indexer not supported" warning
-3. The shader's `required_subgroup_size=32` must be passed via
-   `ggml_vk_create_pipeline` on RDNA3 wave64 devices
+1. Run `test-backend-ops` and verify all cases pass (was 0/108 before the init-order fix — see [vulkan-init-order.md](docs/vulkan-init-order.md))
+2. Test with DeepSeek-V4-Flash IQ3_XXS on a RADV APU to confirm no "Lightning Indexer is not supported" warning
+3. The shader's `required_subgroup_size=32` must be passed via `ggml_vk_create_pipeline` on RDNA3 wave64 devices
 
 ### Python tests
 
 ```bash
-# GGUF Python library tests
 cd gguf-py && python -m pytest tests/
-
-# Tokenizer tests
 python tests/test-tokenizer-0.py
 ```
 
 ### Benchmarking
 
-Use `llama-bench` for parameter sweeps. For end-to-end cache performance
-benchmarks, use the parent project's `scripts/benchmark.sh` which drives
-`llama-server` via HTTP and measures cold/warm TTFT.
+Use `llama-bench` for parameter sweeps. For end-to-end cache performance benchmarks, use the parent project's `scripts/benchmark.sh` which drives `llama-server` via HTTP and measures cold/warm TTFT.
 
 ---
 
-## Commit format
+## Commit Format
 
-CachyLLama uses its own git history as the canonical source of truth (no PR
-workflow — this is a fork). Commits are squash-merged into the main branch
-with descriptive messages:
+CachyLLama uses its own git history as the canonical source of truth (no PR workflow — this is a fork). Commits are squash-merged into the main branch with descriptive messages.
+
+```
+<module>: <commit title>
+```
+
+Examples:
 
 ```
 vulkan: fix Lightning Indexer init order (108/108 on Strix Halo)
@@ -295,9 +253,17 @@ common: extract host_available_ram() from kv-ssd-cache.cpp
 models: add Laguna-S-2.1 support (decoder_arch = "laguna")
 ```
 
+**Pre-commit checklist:**
+
+- `ctest` passes for affected tests
+- Format check: `git diff --name-only | grep -E '\.(c|cpp|h|hpp)$' | xargs clang-format --dry-run -Werror`
+- No `TODO`/`FIXME` comments left
+- No `ai-assisted/` handoff files staged (`git status` then `git reset HEAD ai-assisted/` if needed)
+- Commit message describes what and why; no `Assisted-by:`
+
 ---
 
-## Common commands
+## Development Tools
 
 ```bash
 # Build
@@ -321,192 +287,95 @@ python convert_hf_to_gguf.py /path/to/hf-model
 # CI locally
 ./ci/run.sh
 
-# Format check
-git diff --name-only | grep -E '\.(c|cpp|h|hpp)$' | xargs clang-format --dry-run -Werror
-
 # Search code
 grep -rn "pattern" src/ common/ include/
 ```
 
 ---
 
-## Context checkpoint system (`tools/server/server-context.cpp`)
+## Common Patterns
 
-The server maintains a per-slot ring buffer of in-memory KV cache snapshots
-("context checkpoints") used to skip prompt reprocessing on cached turns
-(LCP / f_keep optimization). Four interlocking pieces -- change one, re-verify
-the others.
+### Environment variables
 
-### 1. Two producer paths feeding one `std::list<common_prompt_checkpoint>`
+| Prefix | Purpose |
+|--------|---------|
+| `GGML_VK_*` | Vulkan backend tuning (shaders, scratch, nodes_per_submit) |
+| `GGML_VK_DISABLE_*` | Opt-out flags for individual Vulkan features |
+| `LLAMA_ARG_*` | CLI flag equivalents for MoE residency offload |
+| `LLAMA_SSD_*` | SSD cache configuration (defaults, not overrides) |
 
-- **`create_checkpoint(slot, n_tokens_cur, pos_min, pos_max)`** -- mid-prompt
-  snapshots fired during prefill when a batch starts a user message (or
-  `--checkpoint-near-end` is set and we're near the prompt end).  Uses the
-  live KV cache's `pos_min` / `pos_max` from `llama_memory_seq_pos_*`,
-  skipping if checkpoints are too close (`params_base.checkpoint_min_step`,
-  default 32768).
-- **`deferred_create_final_checkpoint(slot)`** -- after the first generation
-  token lands, captures a full prompt snapshot at `pos_min=0`,
-  `pos_max = prompt_n_tokens - 1`.  Runs asynchronously so the SSD write
-  doesn't block decode.
+User overrides (that win over the solver in `llama-run.sh` in the parent project) use `*_OVERRIDE` suffix or are passed via CLI flags.
 
-Both add with `emplace_back`, so list position == insertion order.
+### Memory and storage guarantees
 
-### 2. Insertion-order ring buffer eviction (BOTH paths)
+CachyLLama makes different kinds of claims about its optimizations, and they have different levels of support. Use this three-way distinction when documenting or troubleshooting.
 
-When the list reaches `params_base.n_ctx_checkpoints` (typically 8-32), the
-ring buffer pops the FRONT (oldest) and appends the new entry at the back:
+**Things CachyLLama actually guarantees:**
 
-```cpp
-if (size >= n_ctx_checkpoints) {
-    auto & victim = slot.prompt.checkpoints.front();
-    SLT_TRC(slot, "recycling oldest ... (pos_min=%d, pos_max=%d, ...)");
-    slot.prompt.checkpoints.pop_front();
-}
-slot.prompt.checkpoints.emplace_back();
-```
+- An expert in the R+F cache was selected by the R+F algorithm as a good candidate to keep resident.
+- A checkpoint on disk has the on-disk format we wrote (atomic write succeeded).
+- An explicit `user_id` never matches another `user_id`'s checkpoints (namespace hash is per-user).
 
-Why insertion-order, not "highest pos_min": deferred finals all carry
-`pos_min == 0`, so the old strict-greater-than comparator always picked
-`begin()` and recycled slot 1 every time -- a single-slot FIFO with 15 dead
-entries.  Insertion order breaks the tie and gives a true round-robin across
-conversation snapshots.  The acceptance predicate filters by `pos_min` /
-`pos_max` regardless of list position, so cycling doesn't affect matching.
+**Things requested from the OS but not guaranteed:**
 
-Cold-start mid-prompts (created on a fresh slot where `pos_min_thold == 0`
-makes the first batch's `pos_min` equal 0 too) share the same `pos_min == 0`
-signature as deferred finals.  They're valid LCP snapshots either way -- they
-just consume one of the N ring buffer slots.
+- That `MADV_WILLNEED` actually caused pages to be paged in. The kernel may already have them resident (so the call is a no-op), or may ignore the hint.
+- That `MADV_COLD` actually caused the kernel to evict the page. The kernel decides under memory pressure.
+- That the working set fits in physical RAM. We *try* to keep it there, but a competing workload can evict our pages regardless.
 
-### 3. SWA-skipped entries persist across turns
+**Things observed on a particular machine:**
 
-In `get_available()` (`server-context.cpp` ~line 4314) there's an SWA
-invalidation block:
+- The `policy_hit_rate` reported in the per-decode log — the LRU+R+F prediction accuracy. The number is correct but the implication ("the kernel kept our pages") is not.
+- The aggregate residency ratio from `--moe-residency-debug` — the actual physical residency, measured via `mincore()`. This is the ground truth, but it is specific to the workload, hardware, and competing memory pressure at the time of measurement.
 
-```cpp
-for (auto it = slot.prompt.checkpoints.begin(); ...;) {
-    const auto & cur = *it;
-    const bool deferred_final_snapshot = (cur.pos_min == 0);
-    if (!deferred_final_snapshot && cur.pos_max > pos_next) {
-        // erase
-        it = slot.prompt.checkpoints.erase(it);
-    } else { ++it; }
-}
-```
+### Verifying residency is doing what it claims
 
-Deferred-final snapshots (`pos_min == 0`) are preserved across turns.  Without
-this guard, the SWA step would erase every prior deferred final and the ring
-buffer would never accumulate past 2 entries.
+Run the model with `--moe-residency-debug` (Linux only). The per-decode log line shows `policy_hit_rate` and the per-debug-interval line shows the `aggregate ... ratio` (real physical residency). The two should track each other within a few percent on hardware without competing memory pressure. If `policy_hit_rate` is high but `aggregate ratio` is low, the kernel is evicting pages we asked it to keep and the policy is not doing anything. If `advice_einval` in the per-decode summary is non-zero, the kernel is rejecting the `madvise()` advice outright and the policy is definitely not doing anything.
 
-Genuine SWA invalidation still happens inside the LCP acceptance predicate
-(`server-context.cpp` ~line 4198):
+### Verifying SSD cache is doing what it claims
 
-```cpp
-if (n_swa > 0 && cur.pos_max > pos_next) return false;
-```
+Check that the `kv-ssd` on-disk directory uses the expected `conv_hash` or SHA-256 `user_id` prefix (not a raw `user_id`). For atomic-write guarantees, kill the server with `kill -9` mid-checkpoint-write and verify that the prior valid index is recoverable on next startup. The `tests/test-kv-ssd-user-isolation` binary exercises both properties without needing a real model.
 
-That predicate is the right place to filter by SWA coverage; the
-`get_available()` guard exists only to keep the buffer populated, not to make
-SWA-correctness decisions.
+### Independently disabling optimizations
 
-**Don't add a redundant erase here based on SWA coverage -- that path will
-self-conflict.**
+Each CachyLLama-specific optimization can be disabled in isolation so a regression can be bisected to a single cause. The flags:
 
-### 4. Memory budget (`_ckpt_memory_budget()`)
+- `--no-moe-expert-residency` — disables the MoE expert madvise layer. Tracking remains on; the R+F cache and the touch path are skipped.
+- `--cache-ssd` / `--no-cache-ssd` — enables or disables the SSD checkpoint cache. The default is "auto" (enabled when the model is large enough to benefit).
+- `--no-mmap` — implicit: requires `--no-moe-expert-residency` because the madvise layer operates on the mmap'd model file.
+- `LLAMA_ARG_NO_FSYNC=1` — skips the fsync on checkpoint writes for lower write latency at the cost of losing the last checkpoint on crash. Use only for benchmarking, not production.
+- `GGML_VK_NODES_PER_SUBMIT=N` — Vulkan command-buffer batching. The APU default is 8; discrete GPU default is 100. Override when debugging a specific backend issue.
 
-The size-based eviction runs BEFORE count-based eviction in both
-`create_checkpoint()` and `deferred_create_final_checkpoint()`:
-
-```cpp
-size_t _ckpt_memory_budget() const {
-    const size_t default_limit = (size_t)2 * 1024 * 1024 * 1024;  // 2 GiB floor
-    if (params_base.n_ctx_checkpoints <= 0) return default_limit;
-    // 400 MiB per configured checkpoint = 200 MiB working set * 2 headroom.
-    const size_t per = (size_t)params_base.n_ctx_checkpoints * 400 * 1024 * 1024;
-    return std::max(default_limit, per);
-}
-```
-
-The budget scales with `n_ctx_checkpoints` so the auto-scaled count from
-llama-ai (`scripts/optimize.sh`, 8 base + 1 per 8K above 65K context, capped
-at 32) actually fires.  An earlier version coupled it to `cache_ram` (1%) and
-unconditionally capped checkpoints at 3-4 -- the auto-scaling was a no-op.
-
-Worst case at 32 checkpoints: 32 * 400 MiB = 12.8 GiB (the `std::max`
-floors at 2 GiB so small checkpoint counts still get a 2 GiB working
-set).  For the default 16 checkpoints at typical q8_0 KV (~50 MiB each
-~= 800 MiB total), nothing changes.
-
-### 5. LCP acceptance predicate
-
-The walk in `get_available() / receive/decode-input` (`server-context.cpp`
-~line 4264):
-
-```cpp
-const auto it = std::find_if(
-    slot.prompt.checkpoints.rbegin(),
-    slot.prompt.checkpoints.rend(),
-    [&](const auto & cur) {
-        if (n_swa > 0 && cur.pos_max > pos_next) {
-            return false;  // SWA filter
-        }
-        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-    });
-```
-
-Reverse iteration (newest first).  The first qualifying entry wins.  Both
-deferred finals (`pos_min=0`) and early-mid-prompts (`pos_min < pos_min_thold`)
-are accepted; mid-prompts whose `pos_min` falls past `pos_min_thold` but
-haven't been SWA-shifted are also accepted.
-
-### Auto-scaling (from `llama-ai/scripts/optimize.sh`)
-
-```bash
-base_ctx=65536 base_cp=8 scale_per=8192 max_cp=32
-if [[ $ctx -gt $base_ctx ]]; then
-    extra=$(( (ctx - base_ctx) / scale_per ))
-    SOLVER_CHECKPOINTS=$(( base_cp + extra ))
-fi
-[[ $SOLVER_CHECKPOINTS -gt $max_cp ]] && SOLVER_CHECKPOINTS=$max_cp
-```
-
-| Context | Checkpoints |
-| ------- | ----------- |
-| <= 65 K | 8           |
-| 98 K    | 12          |
-| 131 K   | 16          |
-| 196 K   | 24          |
-| 262 K   | 32 (capped) |
-
-Verified on Nimo (Strix Halo) with Laguna-S-2.1 Q5_K_XL at 131K context:
-ring buffer saturates at 16, then cycles oldest-first across turns 1..16,
-1..16, ... -- true round-robin.  f_keep climbs monotonically (0.488 ->
-0.949 across 20 turns), 18 ckpt-restored events after the first cold turn.
+If a workload regresses, the developer should be able to disable exactly one optimization and see the regression go away. If two optimizations share a flag, file a bug — the dependency should be broken.
 
 ---
 
-## CachyLLama development conventions
+## Maintenance Routines
 
-### Upstream tracking
+These are recurring tasks performed periodically to keep CachyLLama's divergence from upstream manageable. When starting a session, check if any are due.
 
-- CachyLLama merges upstream `llama.cpp` master periodically via
-  `git merge upstream/master`
-- Before rebasing or squashing in `CachyLLama/`, push to a backup branch:
-  `git branch backup-before-rebase`
-- After a merge, re-check all CachyLLama carries for conflicts — especially
-  `ggml/src/ggml-vulkan/ggml-vulkan.cpp` (which accumulates shader dispatch
-  additions) and `src/llama-arch.cpp` / `src/llama-model.cpp` (which gain
-  per-model architecture entries)
-- The `patches/` directory in the parent project is deprecated — CachyLLama
-  maintains its changes directly in git history
+### Upstream merge
+
+CachyLLama merges upstream `llama.cpp` master periodically via `git merge upstream/master`. Before merging:
+
+1. Push to a backup branch: `git branch backup-before-rebase`
+2. After the merge, re-check all CachyLLama carries for conflicts — especially `ggml/src/ggml-vulkan/ggml-vulkan.cpp` (which accumulates shader dispatch additions) and `src/llama-arch.cpp` / `src/llama-model.cpp` (which gain per-model architecture entries)
+3. The `patches/` directory in the parent project is deprecated — CachyLLama maintains its changes directly in git history
+
+### Patch-set status re-validation
+
+Each upstream merge can change which carries are still needed. Re-check [docs/patch-set-status.md](docs/patch-set-status.md) and:
+
+- For "Merged upstream" rows: drop the local copy on the next merge, rebase local additions onto the upstream version.
+- For "Not upstreamed" rows: keep carrying; verify the upstream status hasn't changed.
+- For "Upstream added" rows: rebase CachyLLama tuning/gating onto the upstream version when the differences are small enough.
+
+**Watch upstream #24127** (CUDA MMQ refactor) — it added `static_assert((I_) % 32 == 0)` to the CASE macro, so any new `rdna3_5` config must keep `I` as a multiple of 32.
 
 ### Adding a new model
 
 1. Add architecture entries in `src/llama-arch.cpp` and `src/llama-arch.h`
-2. Implement `src/models/{model}.cpp` following the pattern in
-   `docs/development/HOWTO-add-model.md`
-3. Add GGUF metadata keys in `src/llama-model.cpp` if the model has custom
-   hparams
+2. Implement `src/models/{model}.cpp` following the pattern in [docs/development/HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
+3. Add GGUF metadata keys in `src/llama-model.cpp` if the model has custom hparams
 4. Update `convert_hf_to_gguf.py` if the model needs conversion support
 5. Run `test-backend-ops` to verify operator consistency
 
@@ -520,178 +389,11 @@ ring buffer saturates at 16, then cycles oldest-first across turns 1..16,
 
 ### CachyLLama-specific API additions
 
-New public C API functions go in `include/llama.h` (after the upstream API
-section) and `src/llama.cpp`. Follow the existing `LLAMA_API` visibility
-convention. Document with inline comments that describe what, not why —
-git history handles why.
-
-### Environment variable conventions
-
-| Prefix | Purpose |
-|--------|---------|
-| `GGML_VK_*` | Vulkan backend tuning (shaders, scratch, nodes_per_submit) |
-| `GGML_VK_DISABLE_*` | Opt-out flags for individual Vulkan features |
-| `LLAMA_ARG_*` | CLI flag equivalents for MoE residency offload |
-| `LLAMA_SSD_*` | SSD cache configuration (defaults, not overrides) |
-
-User overrides (that win over the solver in `llama-run.sh`) use `*_OVERRIDE`
-suffix or are passed via CLI flags.
+New public C API functions go in `include/llama.h` (after the upstream API section) and `src/llama.cpp`. Follow the existing `LLAMA_API` visibility convention. Document with inline comments that describe what, not why — git history handles why.
 
 ---
 
-## Memory and storage guarantees
-
-CachyLLama makes different kinds of claims about its optimizations, and they
-have different levels of support. When documenting or troubleshooting, use
-this three-way distinction:
-
-### Things CachyLLama actually guarantees
-
-- An expert in the R+F cache was selected by the R+F algorithm as a good
-  candidate to keep resident.
-- A checkpoint on disk has the on-disk format we wrote (atomic write
-  succeeded).
-- An explicit user_id never matches another user_id's checkpoints
-  (namespace hash is per-user).
-
-### Things requested from the OS but not guaranteed
-
-- That `MADV_WILLNEED` actually caused pages to be paged in. The kernel
-  may already have them resident (so the call is a no-op), or may
-  ignore the hint.
-- That `MADV_COLD` actually caused the kernel to evict the page. The
-  kernel decides under memory pressure.
-- That the working set fits in physical RAM. We *try* to keep it
-  there, but a competing workload can evict our pages regardless.
-
-### Things observed on a particular machine
-
-- The `policy_hit_rate` reported in the per-decode log - the
-  LRU+R+F prediction accuracy. The number is correct but the
-  implication ("the kernel kept our pages") is not.
-- The aggregate residency ratio from `--moe-residency-debug` - the
-  actual physical residency, measured via `mincore()`. This is the
-  ground truth, but it is specific to the workload, hardware, and
-  competing memory pressure at the time of measurement.
-
-### Verifying residency is doing what it claims
-
-Run the model with `--moe-residency-debug` (Linux only). The per-decode
-log line shows `policy_hit_rate` and the per-debug-interval line shows
-the `aggregate ... ratio` (real physical residency). The two should
-track each other within a few percent on hardware without competing
-memory pressure. If `policy_hit_rate` is high but `aggregate ratio` is
-low, the kernel is evicting pages we asked it to keep and the policy
-is not doing anything. If `advice_einval` in the per-decode summary
-is non-zero, the kernel is rejecting the `madvise()` advice outright
-and the policy is definitely not doing anything.
-
-### Verifying SSD cache is doing what it claims
-
-Check that the `kv-ssd` on-disk directory uses the expected conv_hash
-or SHA-256 user_id prefix (not a raw user_id). For atomic-write
-guarantees, kill the server with `kill -9` mid-checkpoint-write and
-verify that the prior valid index is recoverable on next startup.
-The `tests/test-kv-ssd-user-isolation` binary exercises both
-properties without needing a real model.
-
-### Independently disabling optimizations
-
-Each CachyLLama-specific optimization can be disabled in isolation so
-that a regression can be bisected to a single cause. The flags:
-
-- `--no-moe-expert-residency` - disables the MoE expert madvise layer.
-  Tracking remains on; the R+F cache and the touch path are skipped.
-- `--cache-ssd` / `--no-cache-ssd` - enables or disables the SSD
-  checkpoint cache. The default is "auto" (enabled when the model is
-  large enough to benefit).
-- `--no-mmap` - implicit: requires `--no-moe-expert-residency` because
-  the madvise layer operates on the mmap'd model file.
-- `LLAMA_ARG_NO_FSYNC=1` - skips the fsync on checkpoint writes for
-  lower write latency at the cost of losing the last checkpoint on
-  crash. Use only for benchmarking, not production.
-- `GGML_VK_NODES_PER_SUBMIT=N` - Vulkan command-buffer batching. The
-  APU default is 8; discrete GPU default is 100. Override when
-  debugging a specific backend issue.
-
-If a workload regresses, the developer should be able to disable
-exactly one optimization and see the regression go away. If two
-optimizations share a flag, file a bug - the dependency should be
-broken.
-
----
-
-## Vulkan init-order critical: Lightning Indexer and DSV4_HC
-
-On devices that enable `VK_EXT_subgroup_size_control` (Strix Halo, RDNA3
-Phoenix, modern Mesa), the four Vulkan feature flags — `lightning_indexer`,
-`dsv4_hc_comb`, `dsv4_hc_pre`, `dsv4_hc_post` — were previously assigned
-**before** `subgroup_require_full_support` was finalized. The flag was set
-from `subgroup_size_control_features.computeFullSubgroups` several lines
-later, so all four evaluated to `false` at init time and the corresponding
-pipelines were never built. `supports_op` then returned `false` at runtime,
-causing fused operations to silently fall back to CPU with the warning:
-
-```
-layer N is assigned to device Vulkan0 but Lightning Indexer is assigned to
-device CPU (usually due to missing support)
-```
-
-**Fix:** The four flag assignments were moved to **after** the
-`subgroup_size_control_features.computeFullSubgroups` probe. Verified on
-Nimo (Strix Halo, gfx1151, Vulkan 1.4, RADV Mesa 26.2) with DeepSeek-V4-Flash
-IQ3_XXS — the warning is gone and the 15k-token prefill runs at 135-150 t/s.
-
----
-
-## Patch-set table
-
-CachyLLama diverges from `upstream/master` by carrying these third-party works.
-Re-evaluate when upstream merges or upstream PRs close.
-
-| Carry | Source | Upstream status | CachyLLama-specific additions |
-|-------|--------|-----------------|------------------------------|
-| Quantized-KV FA prefill dequant (Vulkan) | [Nathanw1014/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494) | PR open, under review by `jeffbolznv` (active July 2026) | Host-RAM gate via `common::host_available_ram()`, three env vars (`GGML_VK_NO_FA_SCRATCH_TRANSPOSE`, `GGML_VK_FA_SCRATCH_SAFETY_MB`, `GGML_VK_FA_SCRATCH_FORCE`), printf-style warning. Files: `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `vulkan-shaders/dequant_q8_0.comp`, `vulkan-shaders/dequant_q4_0.comp`, `vulkan-shaders/vulkan-shaders-gen.cpp`. |
-| FA dequant-once to q4_0/q4_1/q5_0/q5_1 KV | Nathanw1014 carry | Not upstreamed | Extends the dequant-once path to four additional quant types. Env-gated via `GGML_VK_FA_DEQUANT_ALL=1`. |
-| FA contiguize strided f16 KV | Nathanw1014 carry | Not upstreamed | Env-gated via `GGML_VK_FA_KV_CONTIG=1` (default off). Falls back to native path if `required_scratch + safety > device-local capacity`. |
-| Coopmat1 FA P-fragment hoist | Nathanw1014 carry | Not upstreamed | Hoists the P-fragment load out of the hsv_tile loop. Measured +5% on Qwen3.6-35B-A3B prefill, Strix Halo. |
-| Coopmat1 FA Psh query-major | Nathanw1014 carry | Not upstreamed | Stores Psh query-major so the GEMM2 A load vectorizes. |
-| 32-wide subgroup pinning (coopmat1 FA) | Nathanw1014 carry | Not upstreamed | Pins `required_subgroup_size=32` where narrowing is free on RDNA3 wave64. |
-| Bound command buffers by memory traffic | Nathanw1014 carry | Not upstreamed | Replaces flops-based ceiling with memory-traffic-based ceiling for UMA fairness. |
-| Concat transpose shader | Nathanw1014 carry | Not upstreamed | `concat_transpose.comp` for delta-net dim-0 concat. Env-gated via `GGML_VK_CONCAT_TRANSPOSE` (default ON). |
-| MMID row-list prepass | Nathanw1014 carry | Not upstreamed | `mmid_row_lists.comp` for grouped-GEMM redesign. Stage 1 of 2. |
-| MMID f16-B probe | Nathanw1014 carry | Not upstreamed | Env-gated via `GGML_VK_MMID_F16B=1` (default off). |
-| MMID wave32 probe | Nathanw1014 carry | Not upstreamed | Env-gated via `GGML_VK_MMID_WAVE32=1` (default off). |
-| MMID scale cache (q5_K, q4_K, superblock-amortized) | Nathanw1014 carry | Not upstreamed | Shared-memory scale cache for mul_mat_id. |
-| FA MMQ dot product fp32 scaling | Nathanw1014 carry | Not upstreamed | Scales the MMQ dot product in fp32 before narrowing for numerical stability. |
-| FA split-K reduce shader | Nathanw1014 carry | Not upstreamed | `flash_attn_split_k_reduce.comp` for split-K FA on large prompts. |
-| FA top-K selection shader | Nathanw1014 carry | Not upstreamed | `flash_attn_top_k.comp` for DeepSeek sparse FA. |
-| GATED_LINEAR_ATTN | Nathanw1014 carry | Not upstreamed | `f2ef602a7` implements `GGML_OP_GATED_LINEAR_ATTN` for gated linear attention. |
-| DeepSeek-V4 hyper-connection fused ops | [ggml-org/llama.cpp#26578](https://github.com/ggml-org/llama.cpp/pull/26578) | **Merged upstream** (commit `ccbc17862`) | No CachyLLama changes — picked up cleanly in merge. Three shaders: `dsv4_hc_{pre,comb,post}.comp`. HC hardcoded to 4. Tunable with `GGML_VK_DISABLE_DSV4_HC[_COMB|_PRE|_POST]=1`. Measured: prefill +16.4%, decode +41.1% on DSV4-Flash IQ3_XXS, Nimo. |
-| DeepSeek-V4 Lightning Indexer | CachyLLama original | Not upstreamed | `lightning_indexer.comp`, `lightning_indexer_cm.comp`, `lightning_indexer_decode_cm.comp`. 108/108 on test-backend-ops, Strix Halo. See [init-order note](#vulkan-init-order-critical-lightning-indexer-and-dsv4-hc). |
-| DSV4 sparse FA gather-to-compact | CachyLLama original | Not upstreamed | Sparse top-k FA for DeepSeek V4 CSA shape. `flash_attn_top_k.comp`. Test coverage in `8a8e05712`. |
-| FA flash-attn mask optimization | Nathanw1014 carry | Not upstreamed | `flash_attn_mask_opt.comp` for optimized attention mask handling. |
-| FA MMQ funcs shader | Nathanw1014 carry | Not upstreamed | `flash_attn_mmq_funcs.glsl` shared code for MMQ-based FA. |
-| Keep DeepSeek lightning-indexer K cache f16 | Nathanw1014 carry | Not upstreamed | Forces f16 key cache under quantized `-ctk` for Lightning Indexer correctness. |
-| Vulkan APU `nodes_per_submit` auto-lower | CachyLLama original | Not upstreamed (`ggml-vulkan.cpp` still hardcodes 100) | `1c19480da`: defaults to 8 on UMA, 100 on discrete. `GGML_VK_NODES_PER_SUBMIT=N` override. |
-| Strix Halo RDNA3.5 tuning (ROCm/HIP) | gaetan-puleo carry | Upstream added `mmq-config-rdna3-5.cuh` but CachyLLama's `mmq-config-rdna3_5.cuh` has Strix Halo-specific tuning | `71d1e8f2f` bumps I from 48 to 64 in all 232 MMQ CASE entries for upstream #24127 `static_assert((I_) % 32 == 0)`. |
-| `common::host_available_ram()` | CachyLLama original (refactor) | None | Extracted from duplicate implementations in `kv-ssd-cache.cpp` and `kv_page_manager.cpp`. New files `common/host-ram.{h,cpp}`. |
-| DFlash framework | CachyLLama original | Not upstreamed | `src/models/dflash.cpp`. Generic decoder contract via `dflash.decoder_arch` metadata. Currently supports `"laguna"`. |
-| Laguna-S-2.1 | CachyLLama original | Not upstreamed | `src/models/laguna.cpp`. Sigmoid-routed MoE, shared expert, softplus attention gate, QK-norm, per-layer-type RoPE. |
-
-**CachyLLama focus downstream:** If a third-party carry lands upstream cleanly,
-the CachyLLama copy can be dropped on the next `merge upstream/master` and the
-local additions (memory gate, env overrides, follow-up fixes) rebased onto the
-upstream version. When a carry does not get upstreamed, CachyLLama carries it
-indefinitely — re-check upstream status each merge.
-
-**Watch upstream #24127** (CUDA MMQ refactor) when bumping: it added
-`static_assert((I_) % 32 == 0)` to the CASE macro, so any new `rdna3_5` config
-must keep I as a multiple of 32.
-
----
-
-## Anti-patterns
+## Anti-Patterns
 
 | Anti-pattern | Why it's wrong | What to do |
 |--------------|----------------|------------|
@@ -702,28 +404,29 @@ must keep I as a multiple of 32.
 | Ignoring clang-format | Project has strict formatting rules | Run `clang-format`, respect `.editorconfig` |
 | Committing handoff files | Session notes are internal | Keep `ai-assisted/` out of git |
 | Writing `Assisted-by:` in commits | Fork history is our own | Use descriptive commit messages |
+| Hardcoding line numbers in docs | Code shifts, docs go stale | Reference function/struct names, not line numbers |
 
 ---
 
-## Key documentation
+## Key Documentation
 
 | File | Purpose |
 |------|---------|
-| `docs/build.md` | Build instructions for all platforms/backends |
+| `README.md` | Project overview, CLI flags, benchmarks |
+| `docs/build.md` | Build instructions for all platforms/backends (upstream) |
 | `docs/development/HOWTO-add-model.md` | Adding new model support |
 | `docs/development/parsing.md` | PEG parser for model output |
-| `docs/development/user-isolation-design.md` | User isolation architecture |
+| `docs/development/user-isolation-design.md` | User isolation architecture (`user_id` / `u/` namespace / `--max-concurrent-per-user`) |
 | `docs/moe-expert-residency.md` | MoE expert residency mechanism, hit rates, C API |
-| `docs/autoparser.md` | Auto-detecting model features |
-| `docs/ops.md` | ggml operator reference |
-| `docs/ops/Vulkan.csv` | Vulkan op support matrix |
-| `STRIX_HALO_NOTES.md` | Strix Halo / RDNA3.5 development notes |
-| `RDNA3_NOTES.md` | RDNA3 Vulkan development notes |
-| `CEZANNE_NOTES.md` | Cezanne platform notes |
-| `README.md` | This project's high-level overview |
-| `.clio/instructions.md` | Project methodology (Unbroken Method, workflow) |
+| `docs/autoparser.md` | Auto-detecting model features (upstream) |
+| `docs/ops.md` | ggml operator reference (upstream) |
+| `docs/ops/Vulkan.csv` | Vulkan op support matrix (upstream) |
+| `docs/vulkan-init-order.md` | Vulkan feature-flag init-order constraint (Lightning Indexer, DSV4_HC) |
+| `docs/context-checkpoints.md` | Server context checkpoint ring buffer (LCP / f_keep) |
+| `docs/patch-set-status.md` | Third-party carries and upstream status |
+| `.clio/instructions.md` | Project methodology (Unbroken Method) |
 
 ---
 
-*For the llama-ai parent project's development conventions, see the parent
-project's AGENTS.md.*
+*For project methodology and workflow, see `.clio/instructions.md`*
+*For universal agent behavior, see system prompt*

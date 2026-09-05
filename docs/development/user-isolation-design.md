@@ -2,13 +2,18 @@
 
 ## Status
 
-Implemented. Five commits in `master`:
+Shipped. Implemented across the original five-commit series:
 
 - `common : add namespace_prefix to kv_ssd_init for u/ isolation`
 - `server : thread user_id field from request body to server_task`
 - `server : per-user concurrency cap and slot affinity`
 - `server : page manager routes user_id to u/ namespace, no cross-user lookup`
 - `server : return HTTP 429 when per-user concurrency cap is hit`
+
+Subsequent work has refined the design (mutable `mutex_tasks` for the
+const-accessor cap check, anonymous-bucket fairness, `_anonymous` key
+under the cap). The design rationale below describes the original
+implementation; the source of truth for current behaviour is the code.
 
 This document is the design rationale; the source of truth for behaviour
 is the code itself.

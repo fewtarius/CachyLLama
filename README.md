@@ -343,13 +343,16 @@ grows with context: ~256 MiB at 128k for head_dim 128 (Qwen3-Coder-30B-A3B),
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--moe-expert-residency` / `--no-moe-expert-residency` | disabled | Master switch. Tracks MoE expert activations and uses `madvise` to keep hot experts paged into RAM and cold ones released back to the mmap'd file. Requires `--load-mode mmap` (default). |
-| `--moe-resident-per-layer N` | 128 | Max experts kept hot per MoE layer (per-layer LRU size). Must be > 0. |
+| `--moe-resident-per-layer N` | 32 | Max experts kept hot per MoE layer (per-layer LRU size). Must be > 0. |
 | `--moe-prewarm-top-k N` | 16 | Experts to prewarm per layer at startup. Set to 0 to disable prewarm. |
+| `--moe-residency-debug` `[on\|off]` | off | Linux only. Periodically call `mincore()` on each tracked expert and log the physical residency ratio alongside the software policy state. For development and correctness verification, not production. |
+| `--moe-residency-debug-interval N` | 64 | Linux only. Decodes between `mincore()` samples. The `mincore()` call costs O(experts) per sample; tune this to balance observability against overhead. |
 | `--cpu-moe` | disabled | Route all MoE FFN expert tensors to host RAM via `tensor_buft_overrides` (LLM_FFN_EXPS_REGEX). Combine with `--moe-expert-residency` on memory-constrained hardware to mmap the full weights from SSD while keeping only the LRU-resident expert subset in RAM. |
 | `--n-cpu-moe N` | 0 | Route only the first N MoE layers' expert weights to host RAM (0 = use `--cpu-moe` value). |
 
 Environment-variable equivalents: `LLAMA_ARG_MOE_EXPERT_RESIDENCY`,
 `LLAMA_ARG_MOE_RESIDENT_PER_LAYER`, `LLAMA_ARG_MOE_PREWARM_TOP_K`,
+`LLAMA_ARG_MOE_RESIDENCY_DEBUG`, `LLAMA_ARG_MOE_RESIDENCY_DEBUG_INTERVAL`,
 `LLAMA_ARG_CPU_MOE`, `LLAMA_ARG_N_CPU_MOE`.
 
 Hit rate and latency data per model is in
@@ -414,7 +417,7 @@ frequency) and `token_count` for the layer.
 ```c
 // Configure and enable residency
 struct llama_moe_residency_config cfg = llama_moe_residency_config_default();
-cfg.per_layer_limit = 128;     // max experts kept hot per layer
+cfg.max_resident_per_layer = 32;  // max experts kept hot per layer
 cfg.prewarm_top_k   = 16;      // experts to prewarm at startup
 llama_moe_residency_enable(ctx, &cfg);
 
@@ -488,7 +491,8 @@ Indexer, DFlash/Laguna, user isolation, and the Vulkan APU tuning are all
 CachyLLama originals or CachyLLama-led collaborations.
 
 See [AGENTS.md](AGENTS.md) for the full patch-set table and development
-conventions.
+conventions. The full patch-set status table is in
+[docs/patch-set-status.md](docs/patch-set-status.md).
 
 ---
 

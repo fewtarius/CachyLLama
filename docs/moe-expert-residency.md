@@ -7,16 +7,16 @@ Enable running Mixture-of-Experts (MoE) models whose total footprint exceeds ava
 CachyLLama controls a *software policy* (which experts should be in the working set). The Linux kernel controls *physical residency* (which pages are actually in RAM). These are not the same thing:
 
 - `madvise()` is advisory. The kernel is free to ignore the hint, evict pages anyway, or keep cold pages resident under low memory pressure.
-- An expert is "loaded" in our cache the moment we call `MADV_WILLNEED` on it - but the kernel may have already had those pages resident (so the call is a no-op), or may have decided to evict them despite the hint.
-- A 95% "hit rate" reported by the residency layer is the *software policy hit rate* - it tells you the LRU predicted the right experts to keep, not that the kernel kept them.
+- An expert is "loaded" in our cache the moment we call `MADV_WILLNEED` on it — but the kernel may have already had those pages resident (so the call is a no-op), or may have decided to evict them despite the hint.
+- A 95% "hit rate" reported by the residency layer is the *software policy hit rate* — it tells you the LRU predicted the right experts to keep, not that the kernel kept them.
 
-To actually measure physical residency, use `--moe-residency-debug` (Linux only) which periodically calls `mincore()` on each tracked expert and logs the resident/total page ratio. If that ratio is much lower than the policy hit rate, the kernel is evicting pages we asked it to keep - and the policy is not actually doing anything.
+To actually measure physical residency, use `--moe-residency-debug` (Linux only) which periodically calls `mincore()` on each tracked expert and logs the resident/total page ratio. If that ratio is much lower than the policy hit rate, the kernel is evicting pages we asked it to keep — and the policy is not actually doing anything.
 
 The `llama_moe_residency_stats_get()` API exposes both views:
 
-- `total_hits / total_misses` - software policy hits and misses
-- `advice_success / advice_failure / advice_einval` - whether the kernel actually accepted each `madvise()` call
-- `invalid_mapping` - calls skipped because the region wasn't page-alignable
+- `total_hits / total_misses` — software policy hits and misses
+- `advice_success / advice_failure / advice_einval` — whether the kernel actually accepted each `madvise()` call
+- `invalid_mapping` — calls skipped because the region wasn't page-alignable
 
 `advice_einval > 0` is the most important signal: it means the kernel rejected the advice for the mapping type, and the policy is silently no-oping. If you see this, the advice value being used is invalid for the model's `mmap()` layout.
 
@@ -50,52 +50,57 @@ NVMe SSDs have very high random read performance (millions of IOPS for small rea
 
 The trade-off: `madvise` is advisory. The kernel can ignore hints under memory pressure. We measure 99.5%+ *policy hit rate* in steady state on tested models, which is the practical limit of the LRU+R+F prediction; the physical residency rate (measured with `--moe-residency-debug`) tracks the same number on hardware that doesn't have competing memory pressure.
 
-We use `MADV_WILLNEED` on the hot path and `MADV_COLD` on the cold path. Earlier versions used `MADV_DONTNEED` and `MADV_FREE`; both are inappropriate here. `MADV_DONTNEED` is destructive on file-backed mappings (the kernel re-faults from disk on next access, which on Flip-tier hardware turned cold misses into disk page faults and dropped prefill from ~215 t/s to ~56 t/s on a 20 GB MoE model). `MADV_FREE` is rejected with `EINVAL` on the model's `MAP_SHARED | PROT_READ` mapping - the Linux man page is explicit that `MADV_FREE` applies only to *private anonymous* pages. `MADV_COLD` (Linux 5.4+) is the right tool: it is non-destructive (no re-fault needed if the kernel keeps the page) and is valid for file-backed shared mappings.
+We use `MADV_WILLNEED` on the hot path and `MADV_COLD` on the cold path. Earlier versions used `MADV_DONTNEED` and `MADV_FREE`; both are inappropriate here. `MADV_DONTNEED` is destructive on file-backed mappings (the kernel re-faults from disk on next access, which on Flip-tier hardware turned cold misses into disk page faults and dropped prefill from ~215 t/s to ~56 t/s on a 20 GB MoE model). `MADV_FREE` is rejected with `EINVAL` on the model's `MAP_SHARED | PROT_READ` mapping — the Linux man page is explicit that `MADV_FREE` applies only to *private anonymous* pages. `MADV_COLD` (Linux 5.4+) is the right tool: it is non-destructive (no re-fault needed if the kernel keeps the page) and is valid for file-backed shared mappings.
 
 ## CLI flags
 
-```
---moe-expert-residency / --no-moe-expert-residency   master switch (default: disabled)
---moe-resident-per-layer N                         experts kept hot per layer (default: 32)
---moe-prewarm-top-k N                              experts to prewarm at startup (default: 16)
---moe-residency-debug [on|off]                     periodic mincore() sampling (default: off)
---moe-residency-debug-interval N                   decodes between mincore() samples (default: 64)
-```
+| Flag | Default | Env var | Description |
+|------|---------|---------|-------------|
+| `--moe-expert-residency` / `--no-moe-expert-residency` | disabled | `LLAMA_ARG_MOE_EXPERT_RESIDENCY` | Master switch. Tracks MoE expert activations and uses `madvise` to keep hot experts paged into RAM and cold ones released back to the mmap'd file. Requires `--load-mode mmap` (default). |
+| `--moe-resident-per-layer N` | 32 | `LLAMA_ARG_MOE_RESIDENT_PER_LAYER` | Max experts kept hot per MoE layer (per-layer LRU size). Must be > 0. |
+| `--moe-prewarm-top-k N` | 16 | `LLAMA_ARG_MOE_PREWARM_TOP_K` | Experts to prewarm per layer at startup. Set to 0 to disable prewarm. |
+| `--moe-residency-debug` `[on\|off]` | off | `LLAMA_ARG_MOE_RESIDENCY_DEBUG` | Periodic `mincore()` sampling. Linux only. Intended for development and correctness verification, not production. |
+| `--moe-residency-debug-interval N` | 64 | `LLAMA_ARG_MOE_RESIDENCY_DEBUG_INTERVAL` | Decodes between `mincore()` samples. The `mincore()` call costs O(experts) per sample; tune this to balance observability against overhead. |
 
-All available as environment variables: `LLAMA_ARG_MOE_EXPERT_RESIDENCY`, `LLAMA_ARG_MOE_RESIDENT_PER_LAYER`, `LLAMA_ARG_MOE_PREWARM_TOP_K`, `LLAMA_ARG_MOE_RESIDENCY_DEBUG`, `LLAMA_ARG_MOE_RESIDENCY_DEBUG_INTERVAL`.
-
-`--moe-residency-debug` is Linux only. It is intended for development and correctness verification, not production: the `mincore()` call costs O(experts) per sample. Tune `--moe-residency-debug-interval` to balance observability against overhead. The output is logged at `INFO` level and includes both per-expert residency ratios and an aggregate ratio across the cache. To verify the residency policy is doing what it claims, run the model with this flag and compare `policy_hit_rate` (from the per-decode summary) against the `aggregate ... ratio` line. The two should track each other within a few percent on hardware without competing memory pressure.
+To verify the residency policy is doing what it claims, run the model with `--moe-residency-debug` and compare `policy_hit_rate` (from the per-decode summary) against the `aggregate ... ratio` line. The two should track each other within a few percent on hardware without competing memory pressure.
 
 Requires mmap (`--mmap` is the default). Disabling mmap (`--no-mmap`) also disables residency.
 
 ## Public API
 
-[include/llama.h:1579-1680](include/llama.h#L1579-L1680) — the user-facing types and functions.
+The public API lives in `include/llama.h`. Two structures and a handful of functions cover everything.
+
+### `llama_expert_stats` — per-layer activation counts
 
 ```c
 // Per-layer expert activation statistics (cumulative since tracking enabled).
 struct llama_expert_stats {
-    int32_t n_expert;       // number of experts in this layer
-    int32_t n_expert_used;  // number of experts used per token
-    uint64_t total_tokens;  // total tokens processed in this layer
+    int32_t  n_expert;          // number of experts in this layer
+    int32_t  n_expert_used;     // number of experts used per token
+    uint64_t total_tokens;      // total tokens processed in this layer
     uint64_t * activation_count; // [n_expert] per-expert activation count
 };
 
 // Enable/disable expert activation tracking.
-LLAMA_API void  llama_expert_tracking_enable(struct llama_context * ctx, bool enable);
-LLAMA_API bool  llama_expert_tracking_enabled(const struct llama_context * ctx);
+LLAMA_API void llama_expert_tracking_enable(struct llama_context * ctx, bool enable);
+LLAMA_API bool llama_expert_tracking_enabled(const struct llama_context * ctx);
 
-// Read cumulative stats for a specific layer.
+// Read cumulative stats for a specific layer. Returns 0 on success, -1 if tracking disabled.
 LLAMA_API int32_t llama_expert_stats_get(const struct llama_context * ctx,
-                                        int32_t layer, struct llama_expert_stats * stats);
-LLAMA_API void   llama_expert_stats_reset(struct llama_context * ctx);
+                                        int32_t layer,
+                                        struct llama_expert_stats * stats);
+LLAMA_API void    llama_expert_stats_reset(struct llama_context * ctx);
+```
 
+### `llama_expert_last_selection` — most recent per-token expert selection
+
+```c
 // Per-layer snapshot of the most recent decode's top-K expert selection.
 // Used by the SSD loader / offload subsystem to pre-load experts that
 // will likely fire next (temporal locality).
 struct llama_expert_last_selection {
-    int32_t n_expert_used;
-    int32_t n_tokens;
+    int32_t         n_expert_used;
+    int32_t         n_tokens;
     const int32_t * selected;   // [n_tokens * n_expert_used], row-major
 };
 
@@ -103,21 +108,38 @@ LLAMA_API int32_t llama_expert_last_selected_get(const struct llama_context * ct
                                                  int32_t layer,
                                                  struct llama_expert_last_selection * selection);
 LLAMA_API void     llama_expert_last_selected_clear(struct llama_context * ctx);
+```
 
-// MoE expert residency config + control.
+### `llama_moe_residency_config` — residency control
+
+```c
+// Public configuration for MoE expert residency management.
+// All fields are POD for C compatibility.
 struct llama_moe_residency_config {
-    uint8_t  enabled;
-    uint32_t max_resident_per_layer;
-    uint8_t  prewarm_on_init;
-    uint32_t prewarm_top_k;
-    uint8_t  log_per_decode;
+    uint8_t  enabled;                  // master switch (0/1)
+    uint32_t max_resident_per_layer;   // experts kept hot per layer
+    uint8_t  prewarm_on_init;          // prewarm at startup (0/1)
+    uint32_t prewarm_top_k;            // experts to prewarm if no stats
+    uint8_t  log_per_decode;           // log stats every N decodes (0/1)
+    // Linux-only. debug_sample_interval = 0 disables; positive values cause the
+    // residency layer to call mincore() on each tracked expert every N decodes
+    // and log the actual physical residency ratio. Use this to verify the
+    // software policy is actually changing which pages are resident.
+    uint32_t debug_sample_interval;    // default 0 (off)
+    uint32_t debug_max_pages;          // pages sampled per tensor
 };
 
 LLAMA_API struct llama_moe_residency_config llama_moe_residency_config_default(void);
 LLAMA_API int32_t llama_moe_residency_enable(struct llama_context * ctx,
-                                            const struct llama_moe_residency_config * cfg);
-LLAMA_API void     llama_moe_residency_disable(struct llama_context * ctx);
+                                             const struct llama_moe_residency_config * cfg);
+LLAMA_API void    llama_moe_residency_disable(struct llama_context * ctx);
+```
 
+> **Defaults note.** The C struct defaults returned by `llama_moe_residency_config_default()` (`max_resident_per_layer=16`, `prewarm_top_k=8`) are independent of the CLI defaults (`--moe-resident-per-layer=32`, `--moe-prewarm-top-k=16`). The CLI numbers apply when running `llama-server`/`llama-cli`; the struct defaults apply when you wire residency up directly through the C API.
+
+### `llama_moe_residency_stats` — observability
+
+```c
 struct llama_moe_residency_stats {
     uint64_t total_hits;       // expert touches that were already loaded
     uint64_t total_misses;     // expert touches that required MADV_WILLNEED
@@ -132,32 +154,59 @@ struct llama_moe_residency_stats {
 };
 
 LLAMA_API void llama_moe_residency_stats_get(const struct llama_context * ctx,
-                                            struct llama_moe_residency_stats * out);
+                                             struct llama_moe_residency_stats * out);
+```
 
+### Model-path helper
+
+```c
 LLAMA_API void llama_set_model_path(struct llama_context * ctx, const char * path);
 ```
 
+Used by the residency subsystem to derive the co-activation persistence file location. Pass an empty string to disable persistence.
+
 ## Internal data flow
 
-[src/llama-context.cpp:777-867](src/llama-context.cpp#L777-L867) — `track_expert_activations()`. Reads the routing tensors from the compute graph and populates `expert_stats[il].last_selected`. Uses a two-pass read: try `ffn_moe_topk` / `ffn_moe_argsort` (I32), validate the first few entries look like expert IDs; if not, fall back to `ffn_moe_probs` (F32) and compute top-K ourselves.
+The data flow for one decode (per-layer):
 
-[src/llama-context.cpp:2049-2097](src/llama-context.cpp#L2049-L2097) — decode hook. After each `track_expert_activations`, calls `llama_moe_residency_touch_layer_selection` for each layer to update the R+F cache with the just-fired experts.
+```
+decode tick
+   |
+   v
+process_ubatch builds graph (MoE layers produce routing tensors)
+   |
+   v
+track_expert_activations reads ffn_moe_topk / ffn_moe_argsort (or ffn_moe_probs fallback)
+   |
+   v
+expert_stats[il].last_selected populated, per-expert activation_count incremented
+   |
+   v
+llama_moe_residency_touch_layer_selection called per MoE layer
+   |
+   v
+llama_moe_residency_touch updates R+F cache: recency + frequency score
+   |
+   v
+on overflow: lowest-scoring slot evicted via MADV_COLD
+   |
+   v
+on touch: any newly-fired expert that wasn't resident gets MADV_WILLNEED
+   |
+   v
+co-activation matrix records per-layer and cross-layer pair counts
+```
 
-[src/llama-moe-residency.cpp:170-237](src/llama-moe-residency.cpp#L170-L237) — `llama_moe_residency_touch()`. The cache update logic. Score = 0.5 * recency + 0.5 * frequency, evict lowest. Records hits and misses.
-
-[src/llama-moe-coact.cpp:23-77](src/llama-moe-coact.cpp#L23-L77) — co-activation recording. Within-layer pair counts + cross-layer correlations. JSON persistence at `~/.cachylla/coactivation/{model}.json`.
-
-[src/llama-context.cpp:718-770](src/llama-context.cpp#L718-L770) — `sched_reserve()` build hook. Builds the residency state and co-activation matrix after model load, prewarms top-K experts from prior stats if available.
-
-[src/llama-context.cpp:497-501](src/llama-context.cpp#L497-L501) — dtor hook. Saves the co-activation matrix to disk before releasing residency state.
+The per-layer R+F cache is sized by `max_resident_per_layer`. The cross-session co-activation matrix is persisted to `~/.cachylla/coactivation/{model}.json` on graceful shutdown (SIGTERM; SIGKILL bypasses this) and reloaded on the next context init if available.
 
 ## Why R+F cache and not pure LRU
 
 LRU evicts based on access order alone. R+F (recency + frequency) combines:
+
 - **Recency:** `1 / (1 + current_token - last_access)` — high for recently-used experts
 - **Frequency:** `access_count / (1 + current_token - loaded_at)` — high for frequently-used experts
 
-Combined score = 0.5 * recency + 0.5 * frequency. Evict the lowest-scoring slot.
+Combined score = 0.5 × recency + 0.5 × frequency. Evict the lowest-scoring slot.
 
 This addresses the FlashMoE finding that pure LRU evicts hot experts 34% of the time when access patterns have both temporal locality and burst patterns.
 
@@ -174,7 +223,7 @@ Default values are tuned for Qwen3.6-35B-A3B-class models (256 experts, 8 used).
 
 The cache hit rate drops if `--moe-resident-per-layer` is too small to cover the active working set. It doesn't hurt to set it larger than needed — unused slots just sit idle.
 
-`--moe-prewarm-top-k` controls how many experts per layer are pre-paged-in at startup. With persistence (co-activation matrix), we prewarm based on observed usage. Without, we prewarm experts 0..K-1.
+`--moe-prewarm-top-k` controls how many experts per layer are pre-paged-in at startup. With persistence (co-activation matrix), we prewarm based on observed usage. Without, we prewarm experts `0..K-1`.
 
 ## Persistence
 
@@ -184,7 +233,7 @@ The file is plain JSON, ~1-10 MB depending on model size. Schema:
 
 ```json
 {
-  "v": 1,
+  "v":  1,
   "nl": 40,           // number of layers
   "ne": 256,          // number of experts
   "oc": [...],        // observation counts per layer
@@ -199,7 +248,7 @@ The file is plain JSON, ~1-10 MB depending on model size. Schema:
 - **Advisory hints.** The kernel can evict our "hot" pages under pressure. In practice, with sensible `--moe-resident-per-layer`, we stay at 95%+ hit rate.
 - **Doesn't reduce virtual address space.** The model is still mmap'd in full. Linux overcommit handles this for 64-bit, but on 32-bit systems or with strict overcommit, this won't work.
 - **Slow on CPU-only.** Larger models (60+ GB) are SSD-read-bound. Adding GPU offload for non-expert layers (`-ngl 99`) substantially improves throughput.
-- **Argsort tensor workaround needed.** Some MoE architectures (notably Qwen3.6 family) reuse the compute graph across ubatches, which can cause `ffn_moe_argsort` / `ffn_moe_topk` tensor storage to hold stale data. We fall back to computing top-K from the F32 `ffn_moe_probs` tensor when this happens. See `track_expert_activations` for the validation logic.
+- **Argsort tensor workaround needed.** Some MoE architectures (notably Qwen3.6 family) reuse the compute graph across ubatches, which can cause `ffn_moe_argsort` / `ffn_moe_topk` tensor storage to hold stale data. We fall back to computing top-K from the F32 `ffn_moe_probs` tensor when this happens. See `track_expert_activations()` in `src/llama-context.cpp` for the validation logic.
 
 ## Testing
 
@@ -226,9 +275,11 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ```
 
 If hit rate is below 80%:
+
 - Increase `--moe-resident-per-layer` (more memory, better hits)
 - Verify `--mmap` is enabled (default)
 - Check that `--no-warmup` isn't interacting badly (warmup pre-paginates the prompt)
+- Run with `--moe-residency-debug` to see whether the gap is policy or kernel
 
 ## Future work
 

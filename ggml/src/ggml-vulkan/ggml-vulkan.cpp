@@ -6983,7 +6983,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // safe middle ground: ~93% of the nps=100 win on 7840U, well under the
         // amdgpu timeout on any UMA device, and removes the UMA/discrete
         // special case so the same default works on Strix Halo (gfx1151) too.
-        // See RDNA3_NOTES.md. Users can override via GGML_VK_NODES_PER_SUBMIT.
+        // Users can override via GGML_VK_NODES_PER_SUBMIT.
         device->max_nodes_per_submit = 64;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         const char* GGML_VK_NODES_PER_SUBMIT    = getenv("GGML_VK_NODES_PER_SUBMIT");
